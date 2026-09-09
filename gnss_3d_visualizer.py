@@ -44,6 +44,7 @@ PAYLOAD_LONGITUDE_OFFSET = 30
 DEFAULT_SERIAL_PORT = "COM9"
 DEFAULT_BAUD_RATE = 19200
 DEFAULT_HTTP_PORT = 8050
+APP_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -868,7 +869,7 @@ STATUS_COLORS = {
 
 def build_dash_app(store: TelemetryStore, source_label: str) -> Dash:
     app = Dash(__name__)
-    app.title = "Rocket Trajectory"
+    app.title = f"Rocket Trajectory v{APP_VERSION}"
 
     app.layout = html.Div(
         [
@@ -876,7 +877,10 @@ def build_dash_app(store: TelemetryStore, source_label: str) -> Dash:
                 [
                     html.Div(
                         [
-                            html.H1("Rocket Trajectory", style=STYLES["title"]),
+                            html.H1(
+                                f"Rocket Trajectory v{APP_VERSION}",
+                                style=STYLES["title"],
+                            ),
                             html.Div(source_label, style=STYLES["subtitle"]),
                         ]
                     ),

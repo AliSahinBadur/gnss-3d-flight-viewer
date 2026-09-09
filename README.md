@@ -1,5 +1,7 @@
 # GNSS 3D Flight Viewer
 
+Current version: **v2**
+
 This application reads the same 78-byte HYI telemetry packet used by the
 existing project and displays the GNSS trajectory in an interactive 3D view.
 
