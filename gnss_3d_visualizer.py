@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+from bisect import bisect_right
 import math
 import re
 import struct
@@ -82,8 +83,9 @@ COMMON_BAUD_RATES = (
 MIN_SERIAL_BAUD_RATE = 300
 MAX_SERIAL_BAUD_RATE = 4_000_000
 MAX_SERIAL_PORT_LENGTH = 255
-DEFAULT_HTTP_PORT = 8050
+DEFAULT_HTTP_PORT = 8071
 APP_VERSION = 3
+APP_NAME = "Proist Roket Takımı Bilimsel Görev Yazılımı"
 DEFAULT_STALE_TIMEOUT_S = 2.0
 DEFAULT_MAX_PLAUSIBLE_SPEED_MPS = 3_000.0
 MAX_REASONABLE_ALTITUDE_M = 1_000_000.0
@@ -103,6 +105,8 @@ MAP_FIT_FRACTION = 0.85
 MIN_SCENE_AXIS_RATIO = 0.35
 MAP_TERRAIN_PITCH_DEG = 62.0
 MAP_TERRAIN_BEARING_DEG = -22.0
+MAP_REFRESH_INTERVAL_MS = 2_000
+MODE_SELECTION_PROMPT_TIMEOUT_S = 6.0
 MAP_TERRAIN_TILEJSON_URL = "https://tiles.mapterhorn.com/tilejson.json"
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 PARTIAL_REPLAY_MIN_ALTITUDE_DROP_M = 5.0
@@ -214,6 +218,73 @@ class TelemetryPoint:
     east_m: float
     north_m: float
     up_m: float
+
+
+@dataclass(frozen=True)
+class GroundStationLocation:
+    """Validated ground-station marker shown independently from launch origin."""
+
+    latitude_deg: float
+    longitude_deg: float
+    altitude_m: Optional[float] = None
+    accuracy_m: Optional[float] = None
+    source: str = "manual"
+
+
+def parse_ground_station_location(
+    latitude: object,
+    longitude: object,
+    altitude: object = None,
+    accuracy: object = None,
+    source: str = "manual",
+) -> GroundStationLocation:
+    """Validate browser or manually entered ground-station coordinates."""
+
+    try:
+        latitude_deg = float(latitude)
+        longitude_deg = float(longitude)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Enter valid ground-station latitude and longitude") from exc
+    if not math.isfinite(latitude_deg) or not -90.0 <= latitude_deg <= 90.0:
+        raise ValueError("Ground-station latitude must be between -90 and 90")
+    if not math.isfinite(longitude_deg) or not -180.0 <= longitude_deg <= 180.0:
+        raise ValueError("Ground-station longitude must be between -180 and 180")
+
+    altitude_m: Optional[float]
+    if altitude in (None, ""):
+        altitude_m = None
+    else:
+        try:
+            altitude_m = float(altitude)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Ground-station altitude must be a number") from exc
+        if (
+            not math.isfinite(altitude_m)
+            or not -5_000.0 <= altitude_m <= MAX_REASONABLE_ALTITUDE_M
+        ):
+            raise ValueError("Ground-station altitude is outside the supported range")
+
+    accuracy_m: Optional[float]
+    if accuracy in (None, ""):
+        accuracy_m = None
+    else:
+        try:
+            accuracy_m = float(accuracy)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Ground-station accuracy must be a number") from exc
+        if not math.isfinite(accuracy_m) or accuracy_m < 0.0:
+            raise ValueError("Ground-station accuracy cannot be negative")
+
+    location_source = str(source or "manual").strip().casefold()
+    if location_source not in {"computer", "manual"}:
+        raise ValueError("Ground-station source must be computer or manual")
+    return GroundStationLocation(
+        latitude_deg=latitude_deg,
+        longitude_deg=longitude_deg,
+        altitude_m=altitude_m,
+        accuracy_m=accuracy_m,
+        source=location_source,
+    )
 
 
 @dataclass(frozen=True)
@@ -808,6 +879,187 @@ class TelemetryStore:
                 "recording": self._recording,
                 "recorded_count": len(self._recorded_points),
             }
+
+
+class LiveDvrController:
+    """Read-only time-shift cursor over the bounded live telemetry history."""
+
+    def __init__(self, time_fn: Callable[[], float] = time.monotonic) -> None:
+        self._time_fn = time_fn
+        self._lock = threading.RLock()
+        self._at_live_edge = True
+        self._playing = True
+        self._playhead_s = 0.0
+        self._speed = 1.0
+        self._anchor_monotonic = float(self._time_fn())
+        self._anchor_playhead_s = 0.0
+        self._last_live_edge_s: Optional[float] = None
+
+    @staticmethod
+    def _bounds(points: list[TelemetryPoint]) -> tuple[float, float]:
+        if not points:
+            return 0.0, 0.0
+        return float(points[0].time_s), float(points[-1].time_s)
+
+    def _reset_locked(self, live_edge_s: float = 0.0) -> None:
+        now = float(self._time_fn())
+        self._at_live_edge = True
+        self._playing = True
+        self._playhead_s = max(0.0, float(live_edge_s))
+        self._anchor_monotonic = now
+        self._anchor_playhead_s = self._playhead_s
+        self._last_live_edge_s = live_edge_s if live_edge_s > 0.0 else None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reset_locked()
+
+    def _sync_bounds_locked(
+        self,
+        points: list[TelemetryPoint],
+    ) -> tuple[float, float]:
+        minimum_s, live_edge_s = self._bounds(points)
+        if not points:
+            self._reset_locked()
+            return minimum_s, live_edge_s
+        if (
+            self._last_live_edge_s is not None
+            and live_edge_s + 1e-6 < self._last_live_edge_s
+        ):
+            # A new source/session restarted its elapsed-time clock.
+            self._reset_locked(live_edge_s)
+            return minimum_s, live_edge_s
+        self._last_live_edge_s = live_edge_s
+        if self._at_live_edge:
+            self._playhead_s = live_edge_s
+            self._anchor_playhead_s = live_edge_s
+            self._anchor_monotonic = float(self._time_fn())
+        else:
+            clamped = min(max(self._playhead_s, minimum_s), live_edge_s)
+            if not math.isclose(clamped, self._playhead_s, abs_tol=1e-9):
+                self._playhead_s = clamped
+                self._anchor_playhead_s = clamped
+                self._anchor_monotonic = float(self._time_fn())
+            if self._playing and math.isclose(
+                self._playhead_s,
+                live_edge_s,
+                abs_tol=1e-6,
+            ):
+                self._at_live_edge = True
+                self._playing = True
+        return minimum_s, live_edge_s
+
+    def seek(
+        self,
+        target_s: object,
+        points: list[TelemetryPoint],
+    ) -> float:
+        try:
+            requested_s = float(target_s)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Timeline position must be a finite number") from exc
+        if not math.isfinite(requested_s):
+            raise ValueError("Timeline position must be a finite number")
+        with self._lock:
+            minimum_s, live_edge_s = self._sync_bounds_locked(points)
+            if not points:
+                return 0.0
+            self._playhead_s = min(max(requested_s, minimum_s), live_edge_s)
+            self._at_live_edge = math.isclose(
+                self._playhead_s,
+                live_edge_s,
+                abs_tol=1e-6,
+            )
+            if self._at_live_edge:
+                self._playing = True
+            self._anchor_playhead_s = self._playhead_s
+            self._anchor_monotonic = float(self._time_fn())
+            return self._playhead_s
+
+    def toggle(self, points: list[TelemetryPoint]) -> bool:
+        with self._lock:
+            _, live_edge_s = self._sync_bounds_locked(points)
+            if not points:
+                self._playing = False
+                return False
+            if self._at_live_edge:
+                # Pause the view at this instant while ingestion keeps running.
+                self._at_live_edge = False
+                self._playing = False
+                self._playhead_s = live_edge_s
+            else:
+                self._playing = not self._playing
+            self._anchor_playhead_s = self._playhead_s
+            self._anchor_monotonic = float(self._time_fn())
+            return self._playing
+
+    def tick(self, points: list[TelemetryPoint]) -> None:
+        with self._lock:
+            minimum_s, live_edge_s = self._sync_bounds_locked(points)
+            if not points or self._at_live_edge or not self._playing:
+                return
+            now = float(self._time_fn())
+            elapsed_s = max(0.0, now - self._anchor_monotonic)
+            advanced_s = self._anchor_playhead_s + elapsed_s * self._speed
+            if advanced_s >= live_edge_s - 1e-6:
+                self._at_live_edge = True
+                self._playing = True
+                self._playhead_s = live_edge_s
+                self._anchor_playhead_s = live_edge_s
+                self._anchor_monotonic = now
+                return
+            self._playhead_s = min(max(advanced_s, minimum_s), live_edge_s)
+
+    def go_live(self, points: list[TelemetryPoint]) -> float:
+        with self._lock:
+            _, live_edge_s = self._bounds(points)
+            self._reset_locked(live_edge_s)
+            return self._playhead_s
+
+    def set_speed(self, speed: object) -> float:
+        try:
+            normalized_speed = float(speed)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Playback speed must be a positive number") from exc
+        if not math.isfinite(normalized_speed) or normalized_speed <= 0.0:
+            raise ValueError("Playback speed must be a positive number")
+        with self._lock:
+            now = float(self._time_fn())
+            if not self._at_live_edge and self._playing:
+                elapsed_s = max(0.0, now - self._anchor_monotonic)
+                self._playhead_s = (
+                    self._anchor_playhead_s + elapsed_s * self._speed
+                )
+            self._speed = normalized_speed
+            self._anchor_playhead_s = self._playhead_s
+            self._anchor_monotonic = now
+            return self._speed
+
+    def status(self, points: list[TelemetryPoint]) -> dict[str, object]:
+        with self._lock:
+            minimum_s, live_edge_s = self._sync_bounds_locked(points)
+            return {
+                "at_live_edge": self._at_live_edge,
+                "playing": self._playing,
+                "playhead_s": self._playhead_s,
+                "speed": self._speed,
+                "minimum_s": minimum_s,
+                "live_edge_s": live_edge_s,
+                "behind_s": max(0.0, live_edge_s - self._playhead_s),
+                "count": len(points),
+            }
+
+    def visible_points(
+        self,
+        points: list[TelemetryPoint],
+    ) -> list[TelemetryPoint]:
+        with self._lock:
+            self._sync_bounds_locked(points)
+            if self._at_live_edge or not points:
+                return list(points)
+            timestamps = [float(point.time_s) for point in points]
+            end_index = bisect_right(timestamps, self._playhead_s + 1e-9)
+            return list(points[:end_index])
 
 
 class SerialReceiver(threading.Thread):
@@ -1418,9 +1670,12 @@ class SourceManager:
         live_kind: str = "live",
         serial_port: Optional[str] = None,
         baud_rate: Optional[int] = None,
+        initial_mode: str = "live",
     ) -> None:
-        if live_kind not in {"live", "demo"}:
-            raise ValueError("Live source kind must be 'live' or 'demo'")
+        if live_kind not in {"live", "demo", "idle"}:
+            raise ValueError("Live source kind must be 'live', 'demo', or 'idle'")
+        if initial_mode not in {"live", "idle"}:
+            raise ValueError("Initial source mode must be 'live' or 'idle'")
         if (serial_port is None) != (baud_rate is None):
             raise ValueError("Serial port and baud rate must be configured together")
         if serial_port is not None and baud_rate is not None:
@@ -1434,7 +1689,7 @@ class SourceManager:
         self.replay = ReplayController(store)
         self._lock = threading.RLock()
         self._live_source: Optional[threading.Thread] = None
-        self._mode = "live"
+        self._mode = initial_mode
 
     def _stop_live(self) -> bool:
         source = self._live_source
@@ -1545,6 +1800,8 @@ class SourceManager:
             baud_rate,
         )
         with self._lock:
+            if self.live_kind != "live":
+                raise RuntimeError("Select Real flight before connecting a serial port")
             if self.serial_port is None or self.baud_rate is None:
                 raise RuntimeError("Serial controls are unavailable for this source")
             previous_factory = self.live_source_factory
@@ -1574,6 +1831,60 @@ class SourceManager:
             self.baud_rate = normalized_baud
             return normalized_port, normalized_baud
 
+    def select_serial_mode(
+        self,
+        serial_port: object,
+        baud_rate: object,
+    ) -> tuple[str, int]:
+        """Prepare real-flight mode without opening the port before Connect."""
+        normalized_port, normalized_baud = validate_serial_settings(
+            serial_port,
+            baud_rate,
+        )
+        with self._lock:
+            if not self._stop_live():
+                raise RuntimeError("Live source is still stopping")
+            self.store.stop_recording()
+            self.store.clear_track(reset_counters=True)
+            self.store.reset_sequence_tracking()
+            self.replay.unload()
+            port = normalized_port
+            baud = normalized_baud
+            self.serial_port = port
+            self.baud_rate = baud
+            self.live_source_factory = (
+                lambda selected_port=port, selected_baud=baud: SerialReceiver(
+                    self.store,
+                    selected_port,
+                    selected_baud,
+                )
+            )
+            self.live_label = "Real flight / select a COM port and Connect"
+            self.live_kind = "live"
+            self._mode = "idle"
+            self.store.set_status(
+                "waiting",
+                "Real flight selected · choose a COM port and baud rate, then Connect",
+            )
+            return port, baud
+
+    def activate_demo(self) -> None:
+        """Switch to a fresh synthetic flight without losing serial settings."""
+        with self._lock:
+            previous_factory = self.live_source_factory
+            previous_label = self.live_label
+            previous_kind = self.live_kind
+            self.live_source_factory = create_demo_source_factory(self.store)
+            try:
+                self.start_live()
+            except Exception:
+                self.live_source_factory = previous_factory
+                self.live_label = previous_label
+                self.live_kind = previous_kind
+                raise
+            self.live_label = "DEMO source / synthetic 78-byte HYI packet model"
+            self.live_kind = "demo"
+
     def seek_replay(self, playhead_s: float) -> None:
         with self._lock:
             if self._mode == "replay":
@@ -1594,8 +1905,11 @@ class SourceManager:
             )
             status["serial_port"] = self.serial_port
             status["baud_rate"] = self.baud_rate
+            status["source_selected"] = self.live_kind in {"live", "demo"}
             status["source_label"] = (
-                self.live_label if self._mode == "live" else f"CSV replay / {status['name']}"
+                f"CSV replay / {status['name']}"
+                if self._mode == "replay"
+                else self.live_label
             )
             return status
 
@@ -2232,10 +2546,20 @@ def create_map_figure(
     launch_label: str = "Launch",
     include_builtin_reference: bool = False,
     trajectory_name: str = "Reference",
+    ground_station: Optional[GroundStationLocation] = None,
+    empty_state_text: Optional[str] = "Konum verisi bekleniyor…",
 ) -> go.Figure:
     """Create a token-free OpenStreetMap ground-track and terrain view."""
     palette = FIGURE_THEMES.get(theme, FIGURE_THEMES["dark"])
     figure = go.Figure()
+    if points:
+        newest_point = points[-1]
+        map_data_revision = (
+            f"telemetry-{len(points)}-{newest_point.time_s:.6f}-"
+            f"{newest_point.latitude_deg:.8f}-{newest_point.longitude_deg:.8f}"
+        )
+    else:
+        map_data_revision = "telemetry-empty"
 
     map_reference_points = list(trajectory_points or [])
     if include_builtin_reference and not map_reference_points:
@@ -2308,6 +2632,7 @@ def create_map_figure(
 
     if points:
         plotted = _downsample_for_display(points)
+        current = plotted[-1]
         latitude = [point.latitude_deg for point in plotted]
         longitude = [point.longitude_deg for point in plotted]
         customdata = [
@@ -2354,12 +2679,29 @@ def create_map_figure(
         )
         figure.add_trace(
             go.Scattermap(
-                lat=[latitude[-1]],
-                lon=[longitude[-1]],
-                mode="markers",
+                lat=[current.latitude_deg],
+                lon=[current.longitude_deg],
+                mode="markers+text",
                 name="Current",
-                marker={"size": 16, "color": "#ff4d6d"},
-                hovertemplate="Current position<extra></extra>",
+                text=[f"🚀 {current.up_m:+,.0f} m"],
+                textposition="top center",
+                textfont={"color": palette["text"], "size": 13},
+                marker={"size": 20, "color": "#ff4d6d"},
+                customdata=[
+                    [
+                        current.longitude_deg,
+                        current.altitude_m,
+                        current.up_m,
+                        current.time_s,
+                    ]
+                ],
+                hovertemplate=(
+                    "Current position<br>Lat: %{lat:.7f}<br>"
+                    "Lon: %{customdata[0]:.7f}<br>"
+                    "GNSS alt: %{customdata[1]:.1f} m<br>"
+                    "Relative up: %{customdata[2]:.1f} m<br>"
+                    "Time: %{customdata[3]:.1f} s<extra></extra>"
+                ),
             )
         )
         center = {"lat": latitude[-1], "lon": longitude[-1]}
@@ -2385,13 +2727,19 @@ def create_map_figure(
             "lon": launch_point.longitude_deg,
         }
         zoom = 14.5
+    elif ground_station is not None:
+        center = {
+            "lat": ground_station.latitude_deg,
+            "lon": ground_station.longitude_deg,
+        }
+        zoom = 14.5
     else:
         center = {"lat": 40.962105, "lon": 29.129418}
         zoom = 14.5
 
-    if not points and not reference_llh:
+    if not points and not reference_llh and empty_state_text:
         figure.add_annotation(
-            text="Waiting for a live GNSS fix",
+            text=empty_state_text,
             x=0.5,
             y=0.5,
             xref="paper",
@@ -2425,6 +2773,46 @@ def create_map_figure(
         extent_latitude.extend(reference_latitude)
         extent_longitude.extend(reference_longitude)
 
+    if ground_station is not None:
+        station_altitude = (
+            "--"
+            if ground_station.altitude_m is None
+            else f"{ground_station.altitude_m:.1f} m"
+        )
+        station_accuracy = (
+            "--"
+            if ground_station.accuracy_m is None
+            else f"±{ground_station.accuracy_m:.0f} m"
+        )
+        figure.add_trace(
+            go.Scattermap(
+                lat=[ground_station.latitude_deg],
+                lon=[ground_station.longitude_deg],
+                mode="markers+text",
+                name="Ground station",
+                text=["GS"],
+                textposition="top center",
+                marker={"size": 17, "color": "#67a1ff"},
+                customdata=[
+                    [
+                        ground_station.longitude_deg,
+                        station_altitude,
+                        station_accuracy,
+                        ground_station.source,
+                    ]
+                ],
+                hovertemplate=(
+                    "Ground station<br>Lat: %{lat:.7f}<br>"
+                    "Lon: %{customdata[0]:.7f}<br>"
+                    "Altitude: %{customdata[1]}<br>"
+                    "Accuracy: %{customdata[2]}<br>"
+                    "Source: %{customdata[3]}<extra></extra>"
+                ),
+            )
+        )
+        extent_latitude.append(ground_station.latitude_deg)
+        extent_longitude.append(ground_station.longitude_deg)
+
     if extent_latitude and extent_longitude:
         _, extent_center_lon = _longitude_span_and_center(extent_longitude)
         _, extent_center_lat = _latitude_span_and_center(extent_latitude)
@@ -2451,6 +2839,10 @@ def create_map_figure(
         )
 
     figure.update_layout(
+        # The lightweight browser-side stream callback changes trace arrays;
+        # datarevision advertises a fresh coordinate set while uirevision
+        # preserves the operator's chosen map camera.
+        datarevision=map_data_revision,
         uirevision=f"keep-map-{'terrain' if terrain_enabled else 'flat'}",
         map={
             "style": (
@@ -2597,6 +2989,28 @@ def _format_clock(seconds: float) -> str:
     return f"{int(minutes):02d}:{remaining:04.1f}"
 
 
+def map_empty_state_message(
+    mode: object,
+    live_kind: object,
+    prompt_elapsed_s: float = 0.0,
+) -> Optional[str]:
+    """Describe why the map has no position without calling Demo a live GNSS source."""
+
+    normalized_mode = str(mode or "idle").strip().casefold()
+    normalized_kind = str(live_kind or "idle").strip().casefold()
+    if normalized_mode == "live" and normalized_kind == "demo":
+        return "Demo telemetrisi başlatılıyor…"
+    if normalized_mode == "live" and normalized_kind == "live":
+        return "İlk GNSS konumu bekleniyor…"
+    if normalized_mode == "replay":
+        return "Kayıt konumu bekleniyor…"
+    if normalized_kind == "live":
+        return "COM portunu seçip Connect'e bas"
+    if prompt_elapsed_s >= MODE_SELECTION_PROMPT_TIMEOUT_S:
+        return None
+    return "Demo veya Gerçek Uçuş seç"
+
+
 def build_dash_app(
     store: TelemetryStore,
     source_manager: SourceManager,
@@ -2604,8 +3018,9 @@ def build_dash_app(
     stale_timeout_s: float = DEFAULT_STALE_TIMEOUT_S,
 ) -> Dash:
     app = Dash(__name__, update_title=None)
-    app.title = f"Rocket Flight Viewer v{APP_VERSION}"
+    app.title = APP_NAME
     app.server.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+    live_dvr = LiveDvrController()
 
     graph_config = {
         "displaylogo": False,
@@ -2613,13 +3028,42 @@ def build_dash_app(
         "responsive": True,
         "modeBarButtonsToRemove": ["select3d", "lasso3d"],
     }
+    map_graph_config = {
+        **graph_config,
+        # External OSM/DEM tiles cannot be exported reliably by Plotly's
+        # browser-side canvas snapshotter (CORS/MapLibre limitation).
+        "modeBarButtonsToRemove": ["toImage", "select2d", "lasso2d"],
+    }
     initial_manager_status = source_manager.status()
-    serial_configurable = bool(initial_manager_status["serial_configurable"])
+    serial_controls_active = (
+        initial_manager_status["live_kind"] == "live"
+        and initial_manager_status["mode"] in {"idle", "live"}
+    )
     initial_serial_port = (
         initial_manager_status["serial_port"] or DEFAULT_SERIAL_PORT
     )
     initial_baud_rate = (
         initial_manager_status["baud_rate"] or DEFAULT_BAUD_RATE
+    )
+    initial_live_kind = str(initial_manager_status["live_kind"])
+    initial_runtime_mode = str(initial_manager_status["mode"])
+    initial_source_mode_label = (
+        "SIMULATION"
+        if initial_runtime_mode == "live" and initial_live_kind == "demo"
+        else "LIVE"
+        if initial_runtime_mode == "live" and initial_live_kind == "live"
+        else "REPLAY"
+        if initial_runtime_mode == "replay"
+        else "SERIAL READY"
+        if initial_live_kind == "live"
+        else "CHOOSE MODE"
+    )
+    initial_source_message = (
+        "Demo flight is active. Select Real flight whenever hardware is ready."
+        if initial_live_kind == "demo"
+        else "Real flight is active. Select a COM port and baud rate to reconnect."
+        if initial_live_kind == "live"
+        else "Choose Demo flight for a simulated mission or Real flight for COM telemetry."
     )
 
     app.layout = html.Div(
@@ -2631,13 +3075,13 @@ def build_dash_app(
                             html.Img(
                                 src="/assets/rocket.svg",
                                 className="brand-mark",
-                                alt="Rocket Flight Viewer",
+                                alt=APP_NAME,
                             ),
                             html.Div(
                                 [
-                                    html.Div("MISSION TELEMETRY", className="brand-kicker"),
+                                    html.Div("PROİST ROKET TAKIMI", className="brand-kicker"),
                                     html.H1(
-                                        f"Rocket Flight Viewer v{APP_VERSION}",
+                                        APP_NAME,
                                         className="brand-title",
                                     ),
                                     html.Div(
@@ -2661,19 +3105,43 @@ def build_dash_app(
                                 className="status-chip",
                                 **{"data-status": "waiting"},
                             ),
-                            html.Div("LIVE", id="source-mode", className="mode-pill"),
+                            html.Div(
+                                initial_source_mode_label,
+                                id="source-mode",
+                                className="mode-pill",
+                            ),
                             html.Div("REC OFF", id="record-indicator", className="mode-pill"),
                             html.Button(
                                 "Start recording",
                                 id="record-toggle",
                                 n_clicks=0,
                                 className="button button-primary",
+                                disabled=initial_runtime_mode != "live",
                             ),
                             html.Button(
                                 "Export CSV",
                                 id="export-recording",
                                 n_clicks=0,
                                 className="button",
+                            ),
+                            html.Button(
+                                [
+                                    html.Span(
+                                        "⌖",
+                                        className="station-trigger-icon",
+                                        **{"aria-hidden": "true"},
+                                    ),
+                                    html.Span("GS", className="station-trigger-label"),
+                                ],
+                                id="ground-station-toggle",
+                                n_clicks=0,
+                                className="button station-popup-trigger",
+                                title="Yer istasyonu konumunu ayarla",
+                                **{
+                                    "aria-controls": "ground-station-popover",
+                                    "aria-haspopup": "dialog",
+                                    "aria-label": "Yer istasyonu",
+                                },
                             ),
                             html.Button(
                                 "Light mode",
@@ -2694,6 +3162,66 @@ def build_dash_app(
                     ),
                 ],
                 className="topbar",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("DATA SOURCE", className="source-choice-kicker"),
+                            html.H2("Choose flight mode", className="source-choice-title"),
+                            html.Div(
+                                "One application and one dashboard; only the telemetry source changes.",
+                                className="source-choice-subtitle",
+                            ),
+                        ],
+                        className="source-choice-copy",
+                    ),
+                    html.Div(
+                        [
+                            html.Button(
+                                [
+                                    html.Span("DEMO", className="source-choice-tag"),
+                                    html.Span("Demo flight", className="source-choice-name"),
+                                    html.Span(
+                                        "Run a synthetic mission without hardware",
+                                        className="source-choice-description",
+                                    ),
+                                ],
+                                id="source-demo",
+                                n_clicks=0,
+                                className=(
+                                    "source-choice-button source-choice-active"
+                                    if initial_live_kind == "demo"
+                                    else "source-choice-button"
+                                ),
+                            ),
+                            html.Button(
+                                [
+                                    html.Span("SERIAL", className="source-choice-tag"),
+                                    html.Span("Real flight", className="source-choice-name"),
+                                    html.Span(
+                                        "Receive live telemetry from the selected COM port",
+                                        className="source-choice-description",
+                                    ),
+                                ],
+                                id="source-live",
+                                n_clicks=0,
+                                className=(
+                                    "source-choice-button source-choice-active"
+                                    if initial_live_kind == "live"
+                                    else "source-choice-button"
+                                ),
+                            ),
+                        ],
+                        className="source-choice-actions",
+                    ),
+                    html.Div(
+                        initial_source_message,
+                        id="source-choice-message",
+                        className="source-choice-message",
+                    ),
+                ],
+                className="source-choice-panel",
             ),
             html.Div(
                 [
@@ -2752,7 +3280,7 @@ def build_dash_app(
                                 value=initial_serial_port,
                                 clearable=False,
                                 searchable=True,
-                                disabled=not serial_configurable,
+                                disabled=not serial_controls_active,
                                 className="serial-select serial-port-select",
                             ),
                             html.Button(
@@ -2760,7 +3288,7 @@ def build_dash_app(
                                 id="serial-refresh",
                                 n_clicks=0,
                                 className="button",
-                                disabled=not serial_configurable,
+                                disabled=not serial_controls_active,
                                 title="Refresh detected serial ports",
                             ),
                             dcc.Dropdown(
@@ -2769,7 +3297,7 @@ def build_dash_app(
                                 value=initial_baud_rate,
                                 clearable=False,
                                 searchable=False,
-                                disabled=not serial_configurable,
+                                disabled=not serial_controls_active,
                                 className="serial-select serial-baud-select",
                             ),
                             html.Button(
@@ -2777,19 +3305,24 @@ def build_dash_app(
                                 id="serial-connect",
                                 n_clicks=0,
                                 className="button button-primary",
-                                disabled=not serial_configurable,
+                                disabled=not serial_controls_active,
                             ),
                             html.Span(
                                 (
                                     "Select settings, then Connect"
-                                    if serial_configurable
-                                    else "Unavailable in demo mode"
+                                    if serial_controls_active
+                                    else "Select Real flight to configure serial"
                                 ),
                                 id="serial-config-message",
                                 className="control-hint",
                             ),
                         ],
-                        className="control-group serial-control-group",
+                        id="serial-control-group",
+                        className=(
+                            "control-group serial-control-group"
+                            if serial_controls_active
+                            else "control-group serial-control-group serial-controls-hidden"
+                        ),
                     ),
                     html.Div(
                         [
@@ -2803,13 +3336,25 @@ def build_dash_app(
                             html.Button(
                                 (
                                     "Demo active"
-                                    if source_manager.live_kind == "demo"
+                                    if initial_runtime_mode == "live"
+                                    and initial_live_kind == "demo"
                                     else "Live active"
+                                    if initial_runtime_mode == "live"
+                                    and initial_live_kind == "live"
+                                    else "Return to demo"
+                                    if initial_runtime_mode == "replay"
+                                    and initial_live_kind == "demo"
+                                    else "Return to live"
+                                    if initial_runtime_mode == "replay"
+                                    and initial_live_kind == "live"
+                                    else "Real flight ready"
+                                    if initial_live_kind == "live"
+                                    else "Choose mode"
                                 ),
                                 id="return-live",
                                 n_clicks=0,
                                 className="button",
-                                disabled=True,
+                                disabled=initial_runtime_mode != "replay",
                             ),
                             html.Button(
                                 "Reset track",
@@ -2822,6 +3367,125 @@ def build_dash_app(
                     ),
                 ],
                 className="command-bar",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "YER İSTASYONU",
+                                        className="ground-station-popover-kicker",
+                                    ),
+                                    html.Div(
+                                        "Konum ayarları",
+                                        className="ground-station-popover-title",
+                                    ),
+                                ]
+                            ),
+                            html.Button(
+                                "×",
+                                id="ground-station-close",
+                                n_clicks=0,
+                                className="ground-station-popover-close",
+                                title="Pencereyi kapat",
+                                **{"aria-label": "Yer istasyonu penceresini kapat"},
+                            ),
+                        ],
+                        className="ground-station-popover-header",
+                    ),
+                    html.Div(
+                        "Konum Windows üzerinden otomatik alınır. Alınamazsa "
+                        "koordinatları elle girebilirsin.",
+                        className="ground-station-popover-copy",
+                    ),
+                    html.Div(
+                        [
+                            html.Label(
+                                [
+                                    html.Span("Enlem", className="ground-station-label"),
+                                    dcc.Input(
+                                        id="ground-station-latitude",
+                                        type="number",
+                                        min=-90,
+                                        max=90,
+                                        step="any",
+                                        placeholder="40.962105",
+                                        debounce=True,
+                                        className="ground-station-input",
+                                    ),
+                                ],
+                                className="ground-station-field",
+                            ),
+                            html.Label(
+                                [
+                                    html.Span("Boylam", className="ground-station-label"),
+                                    dcc.Input(
+                                        id="ground-station-longitude",
+                                        type="number",
+                                        min=-180,
+                                        max=180,
+                                        step="any",
+                                        placeholder="29.129418",
+                                        debounce=True,
+                                        className="ground-station-input",
+                                    ),
+                                ],
+                                className="ground-station-field",
+                            ),
+                            html.Label(
+                                [
+                                    html.Span(
+                                        "Rakım (m, isteğe bağlı)",
+                                        className="ground-station-label",
+                                    ),
+                                    dcc.Input(
+                                        id="ground-station-altitude",
+                                        type="number",
+                                        step="any",
+                                        placeholder="0",
+                                        debounce=True,
+                                        className="ground-station-input",
+                                    ),
+                                ],
+                                className="ground-station-field ground-station-field-wide",
+                            ),
+                        ],
+                        className="ground-station-input-grid",
+                    ),
+                    html.Div(
+                        [
+                            html.Button(
+                                "Bilgisayardan al",
+                                id="ground-station-auto",
+                                n_clicks=0,
+                                className="button",
+                            ),
+                            html.Button(
+                                "Konumu kaydet",
+                                id="ground-station-apply",
+                                n_clicks=0,
+                                className="button button-primary",
+                            ),
+                        ],
+                        className="ground-station-actions",
+                    ),
+                    html.Div(
+                        "Bilgisayar konumu isteniyor…",
+                        id="ground-station-status",
+                        className="ground-station-status",
+                    ),
+                    html.Div(
+                        "Haritada GS işaretiyle gösterilir.",
+                        className="ground-station-map-note",
+                    ),
+                ],
+                id="ground-station-popover",
+                className="ground-station-popover",
+                hidden=True,
+                role="dialog",
+                **{"aria-label": "Yer istasyonu konum ayarları"},
             ),
             html.Div(
                 [
@@ -2879,12 +3543,12 @@ def build_dash_app(
                                             html.Div(
                                                 [
                                                     html.Div(
-                                                        "3D terrain recovery map",
+                                                        "3D terrain / ground track map",
                                                         className="panel-title",
                                                     ),
                                                     html.Div(
-                                                        "Live/replay ground track over "
-                                                        "OpenStreetMap elevation",
+                                                        "Horizontal live/replay track · "
+                                                        "rocket label shows relative altitude",
                                                         className="panel-subtitle",
                                                     ),
                                                 ]
@@ -2907,13 +3571,28 @@ def build_dash_app(
                                         ],
                                         className="panel-header",
                                     ),
-                                    dcc.Graph(
-                                        id="map-graph",
-                                        figure=create_map_figure(
-                                            [], terrain_enabled=True
-                                        ),
-                                        config=graph_config,
-                                        className="map-stage",
+                                    html.Div(
+                                        [
+                                            dcc.Graph(
+                                                id="map-graph",
+                                                figure=create_map_figure(
+                                                    [],
+                                                    terrain_enabled=True,
+                                                    empty_state_text=map_empty_state_message(
+                                                        initial_runtime_mode,
+                                                        initial_live_kind,
+                                                    ),
+                                                ),
+                                                config=map_graph_config,
+                                                className="map-stage",
+                                            ),
+                                            html.Div(
+                                                id="map-live-badge",
+                                                className="map-live-badge",
+                                            ),
+                                        ],
+                                        id="map-graph-host",
+                                        className="map-graph-host",
                                     ),
                                 ],
                                 id="map-panel",
@@ -2974,7 +3653,11 @@ def build_dash_app(
                             ),
                             html.Div(
                                 [
-                                    html.Div("REPLAY CONTROL", className="info-title"),
+                                    html.Div(
+                                        "TIMELINE / PLAYBACK",
+                                        id="playback-title",
+                                        className="info-title",
+                                    ),
                                     html.Div(
                                         [
                                             html.Button(
@@ -2989,6 +3672,7 @@ def build_dash_app(
                                                 id="replay-restart",
                                                 n_clicks=0,
                                                 className="button",
+                                                disabled=True,
                                             ),
                                             dcc.Dropdown(
                                                 id="replay-speed",
@@ -3003,6 +3687,7 @@ def build_dash_app(
                                                 value=1.0,
                                                 clearable=False,
                                                 searchable=False,
+                                                disabled=True,
                                                 style={"width": "92px"},
                                             ),
                                         ],
@@ -3030,18 +3715,18 @@ def build_dash_app(
                                             html.Div(
                                                 "00:00.0 / 00:00.0",
                                                 id="replay-time",
-                                                className="replay-time",
+                                                className="replay-time timeline-live",
                                             ),
                                         ],
                                         className="playback-row",
                                     ),
                                     html.Div(
-                                        "No replay loaded",
+                                        "No live source or replay",
                                         id="replay-file-name",
                                         className="info-value",
                                     ),
                                     html.Div(
-                                        "Load a recorded CSV to enable playback.",
+                                        "Start Demo/Real flight or load a recorded CSV.",
                                         id="playback-message",
                                         className="panel-subtitle",
                                     ),
@@ -3108,7 +3793,26 @@ def build_dash_app(
             dcc.Store(id="playback-revision", data={"revision": 0, "feedback": ""}),
             dcc.Store(id="recording-revision", data=0),
             dcc.Store(id="serial-revision", data=0),
+            dcc.Store(
+                id="source-mode-revision",
+                data={"revision": 0, "feedback": ""},
+            ),
+            dcc.Store(
+                id="ground-station-store",
+                storage_type="session",
+                data=None,
+            ),
+            dcc.Store(id="map-stream-data", data=None),
+            dcc.Store(id="map-stream-applied", data=None),
             dcc.Store(id="rendered-playhead", data=0.0),
+            dcc.Geolocation(
+                id="ground-station-geolocation",
+                update_now=True,
+                high_accuracy=True,
+                maximum_age=60_000,
+                timeout=10_000,
+                show_alert=False,
+            ),
             dcc.Download(id="telemetry-download"),
             dcc.Interval(
                 id="serial-initializer",
@@ -3117,6 +3821,11 @@ def build_dash_app(
                 max_intervals=1,
             ),
             dcc.Interval(id="refresh-timer", interval=500, n_intervals=0),
+            dcc.Interval(
+                id="map-refresh-timer",
+                interval=MAP_REFRESH_INTERVAL_MS,
+                n_intervals=0,
+            ),
         ],
         id="app-shell",
         className="app-shell",
@@ -3177,6 +3886,233 @@ def build_dash_app(
         return "visual-panel", "visual-panel map-hidden"
 
     @app.callback(
+        Output("serial-control-group", "className"),
+        Output("serial-port-select", "disabled"),
+        Output("serial-refresh", "disabled"),
+        Output("serial-baud-select", "disabled"),
+        Output("serial-connect", "disabled"),
+        Input("source-mode-revision", "data"),
+        Input("playback-revision", "data"),
+        Input("serial-revision", "data"),
+    )
+    def update_serial_control_visibility(
+        _source_revision: Optional[dict[str, object]],
+        _playback_revision: Optional[dict[str, object]],
+        _serial_revision: Optional[int],
+    ):
+        manager_status = source_manager.status()
+        visible = (
+            manager_status["live_kind"] == "live"
+            and manager_status["mode"] in {"idle", "live"}
+        )
+        return (
+            (
+                "control-group serial-control-group"
+                if visible
+                else "control-group serial-control-group serial-controls-hidden"
+            ),
+            not visible,
+            not visible,
+            not visible,
+            not visible,
+        )
+
+    @app.callback(
+        Output("ground-station-popover", "hidden"),
+        Input("ground-station-toggle", "n_clicks"),
+        Input("ground-station-close", "n_clicks"),
+        State("ground-station-popover", "hidden"),
+        prevent_initial_call=True,
+    )
+    def toggle_ground_station_popover(
+        _toggle_clicks: int,
+        _close_clicks: int,
+        currently_hidden: bool,
+    ) -> bool:
+        if ctx.triggered_id == "ground-station-close":
+            return True
+        return not bool(currently_hidden)
+
+    @app.callback(
+        Output("ground-station-geolocation", "update_now"),
+        Input("ground-station-auto", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def request_ground_station_location(_clicks: int) -> bool:
+        return True
+
+    @app.callback(
+        Output("ground-station-store", "data"),
+        Output("ground-station-latitude", "value"),
+        Output("ground-station-longitude", "value"),
+        Output("ground-station-altitude", "value"),
+        Output("ground-station-status", "children"),
+        Input("ground-station-geolocation", "position"),
+        Input("ground-station-geolocation", "position_error"),
+        Input("ground-station-apply", "n_clicks"),
+        State("ground-station-latitude", "value"),
+        State("ground-station-longitude", "value"),
+        State("ground-station-altitude", "value"),
+        State("ground-station-store", "data"),
+        prevent_initial_call=True,
+    )
+    def update_ground_station_location(
+        position: Optional[dict[str, object]],
+        position_error: Optional[dict[str, object]],
+        _apply_clicks: int,
+        manual_latitude: object,
+        manual_longitude: object,
+        manual_altitude: object,
+        _current_location: Optional[dict[str, object]],
+    ):
+        try:
+            if ctx.triggered_id == "ground-station-apply":
+                location = parse_ground_station_location(
+                    manual_latitude,
+                    manual_longitude,
+                    manual_altitude,
+                    source="manual",
+                )
+                message = "Yer istasyonu konumu kaydedildi"
+            elif ctx.triggered_id == "ground-station-geolocation":
+                triggered_properties = getattr(ctx, "triggered_prop_ids", {})
+                if (
+                    "ground-station-geolocation.position_error"
+                    in triggered_properties
+                    and position_error
+                ):
+                    return (
+                        no_update,
+                        no_update,
+                        no_update,
+                        no_update,
+                        "Otomatik konum alınamadı. İzinleri kontrol et veya "
+                        "koordinatları elle gir.",
+                    )
+                if (
+                    position
+                    and position.get("lat") is not None
+                    and position.get("lon") is not None
+                ):
+                    automatic_altitude = position.get("alt")
+                    if automatic_altitude is not None:
+                        try:
+                            if not math.isfinite(float(automatic_altitude)):
+                                automatic_altitude = None
+                        except (TypeError, ValueError, OverflowError):
+                            automatic_altitude = None
+                    automatic_accuracy = position.get("accuracy")
+                    if automatic_accuracy is not None:
+                        try:
+                            if (
+                                not math.isfinite(float(automatic_accuracy))
+                                or float(automatic_accuracy) < 0.0
+                            ):
+                                automatic_accuracy = None
+                        except (TypeError, ValueError, OverflowError):
+                            automatic_accuracy = None
+                    location = parse_ground_station_location(
+                        position.get("lat"),
+                        position.get("lon"),
+                        automatic_altitude,
+                        automatic_accuracy,
+                        source="computer",
+                    )
+                    accuracy_text = (
+                        ""
+                        if location.accuracy_m is None
+                        else f" · ±{location.accuracy_m:.0f} m"
+                    )
+                    message = f"Bilgisayar konumu alındı{accuracy_text}"
+                elif position_error:
+                    return (
+                        no_update,
+                        no_update,
+                        no_update,
+                        no_update,
+                        "Otomatik konum alınamadı. İzinleri kontrol et veya "
+                        "koordinatları elle gir.",
+                    )
+                else:
+                    return (no_update,) * 5
+            else:
+                return (no_update,) * 5
+        except (TypeError, ValueError):
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                "Geçerli bir enlem, boylam ve isteğe bağlı rakım gir.",
+            )
+
+        location_data = {
+            "latitude_deg": location.latitude_deg,
+            "longitude_deg": location.longitude_deg,
+            "altitude_m": location.altitude_m,
+            "accuracy_m": location.accuracy_m,
+            "source": location.source,
+        }
+        return (
+            location_data,
+            location.latitude_deg,
+            location.longitude_deg,
+            location.altitude_m,
+            message,
+        )
+
+    @app.callback(
+        Output("source-mode-revision", "data"),
+        Input("source-demo", "n_clicks"),
+        Input("source-live", "n_clicks"),
+        State("serial-port-select", "value"),
+        State("serial-baud-select", "value"),
+        State("source-mode-revision", "data"),
+        prevent_initial_call=True,
+    )
+    def select_flight_source(
+        _demo_clicks: int,
+        _live_clicks: int,
+        serial_port: object,
+        baud_rate: object,
+        revision: Optional[dict[str, object]],
+    ) -> dict[str, object]:
+        previous_revision = int((revision or {}).get("revision", 0))
+        feedback = ""
+        try:
+            manager_status = source_manager.status()
+            if ctx.triggered_id == "source-demo":
+                if (
+                    manager_status["mode"] == "live"
+                    and manager_status["live_kind"] == "demo"
+                ):
+                    feedback = "Demo flight is already active."
+                else:
+                    source_manager.activate_demo()
+                    live_dvr.reset()
+                    feedback = "Demo flight started from a fresh launch · REC OFF"
+            elif ctx.triggered_id == "source-live":
+                if (
+                    manager_status["mode"] in {"live", "idle"}
+                    and manager_status["live_kind"] == "live"
+                ):
+                    feedback = (
+                        "Real flight is already connected."
+                        if manager_status["mode"] == "live"
+                        else "Real flight is ready · select settings, then Connect."
+                    )
+                else:
+                    source_manager.select_serial_mode(serial_port, baud_rate)
+                    live_dvr.reset()
+                    feedback = (
+                        "Real flight is ready · select settings, then Connect "
+                        "· REC OFF"
+                    )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            feedback = str(exc)
+        return {"revision": previous_revision + 1, "feedback": feedback}
+
+    @app.callback(
         Output("serial-port-select", "options"),
         Output("serial-port-select", "value"),
         Output("serial-baud-select", "options"),
@@ -3218,6 +4154,12 @@ def build_dash_app(
                     message,
                     next_revision,
                 )
+            manager_status = source_manager.status()
+            if not (
+                manager_status["live_kind"] == "live"
+                and manager_status["mode"] in {"idle", "live"}
+            ):
+                raise RuntimeError("Serial controls are available only in Real flight")
             normalized_port, normalized_baud = validate_serial_settings(
                 serial_port,
                 baud_rate,
@@ -3241,6 +4183,7 @@ def build_dash_app(
                     normalized_port,
                     normalized_baud,
                 )
+                live_dvr.reset()
                 return (
                     enumerate_serial_port_options(normalized_port),
                     normalized_port,
@@ -3350,6 +4293,7 @@ def build_dash_app(
             if trigger == "replay-upload" and replay_contents:
                 samples = parse_telemetry_csv(_decode_dash_upload(replay_contents))
                 source_manager.load_replay(samples, filename or "telemetry.csv")
+                live_dvr.reset()
                 if speed is not None:
                     source_manager.set_replay_speed(float(speed))
                 feedback = f"{len(samples):,} telemetry samples loaded"
@@ -3359,26 +4303,51 @@ def build_dash_app(
             elif trigger == "replay-upload":
                 return no_update, no_update
             elif trigger == "replay-play":
-                source_manager.toggle_replay()
-            elif trigger == "replay-restart":
-                source_manager.seek_replay(0.0)
-            elif trigger == "return-live":
                 if source_manager.status()["mode"] == "replay":
-                    if source_manager.status()["serial_configurable"]:
+                    source_manager.toggle_replay()
+                elif source_manager.status()["mode"] == "live":
+                    live_points, _ = store.snapshot()
+                    live_dvr.toggle(live_points)
+            elif trigger == "replay-restart":
+                if source_manager.status()["mode"] == "replay":
+                    source_manager.seek_replay(0.0)
+                elif source_manager.status()["mode"] == "live":
+                    live_points, _ = store.snapshot()
+                    if live_points:
+                        live_dvr.seek(live_points[0].time_s, live_points)
+            elif trigger == "return-live":
+                manager_status = source_manager.status()
+                if manager_status["mode"] == "live":
+                    live_points, _ = store.snapshot()
+                    dvr_status = live_dvr.status(live_points)
+                    if bool(dvr_status["at_live_edge"]):
+                        feedback = "Already at the live edge"
+                    else:
+                        live_dvr.go_live(live_points)
+                        feedback = "Jumped to LIVE · receiver and recording were not interrupted"
+                elif manager_status["mode"] == "replay":
+                    if manager_status["live_kind"] == "live":
                         connected_port, connected_baud = (
                             source_manager.configure_serial(serial_port, baud_rate)
                         )
+                        live_dvr.reset()
                         feedback = (
                             f"Live source reconnected on {connected_port} at "
                             f"{connected_baud:,} baud · recording OFF"
                         )
-                    else:
-                        source_manager.start_live()
+                    elif manager_status["live_kind"] == "demo":
+                        source_manager.activate_demo()
+                        live_dvr.reset()
                         feedback = "Demo source resumed · recording OFF"
+                    else:
+                        feedback = "Choose Demo flight or Real flight before returning."
                 else:
-                    feedback = "Live source is already active · recording OFF"
+                    feedback = "No replay is active · recording OFF"
             elif trigger == "replay-speed" and speed is not None:
-                source_manager.set_replay_speed(float(speed))
+                if source_manager.status()["mode"] == "replay":
+                    source_manager.set_replay_speed(float(speed))
+                elif source_manager.status()["mode"] == "live":
+                    live_dvr.set_speed(float(speed))
         except (RuntimeError, TypeError, ValueError) as exc:
             feedback = str(exc)
             if ctx.triggered_id == "replay-upload":
@@ -3407,21 +4376,27 @@ def build_dash_app(
         ):
             return
         try:
-            source_manager.seek_replay(float(slider_value))
+            if source_manager.status()["mode"] == "replay":
+                source_manager.seek_replay(float(slider_value))
+            elif source_manager.status()["mode"] == "live":
+                live_points, _ = store.snapshot()
+                live_dvr.seek(float(slider_value), live_points)
         except (TypeError, ValueError) as exc:
-            store.set_status("error", f"Replay seek failed: {exc}")
+            store.set_status("error", f"Timeline seek failed: {exc}")
 
     @app.callback(
         Output("app-shell", "data-theme"),
         Output("theme-toggle", "children"),
         Output("trajectory-graph", "figure"),
-        Output("map-graph", "figure"),
         Output("profile-graph", "figure"),
         Output("source-status", "children"),
         Output("source-status-chip", "data-status"),
         Output("source-mode", "children"),
         Output("source-label", "children"),
         Output("source-message", "children"),
+        Output("source-choice-message", "children"),
+        Output("source-demo", "className"),
+        Output("source-live", "className"),
         Output("latitude-value", "children"),
         Output("longitude-value", "children"),
         Output("altitude-value", "children"),
@@ -3445,22 +4420,29 @@ def build_dash_app(
         Output("replay-play", "children"),
         Output("replay-play", "className"),
         Output("replay-play", "disabled"),
+        Output("replay-restart", "children"),
+        Output("replay-restart", "disabled"),
+        Output("replay-speed", "disabled"),
         Output("replay-file-name", "children"),
         Output("replay-time", "children"),
+        Output("replay-time", "className"),
         Output("replay-slider", "value"),
         Output("rendered-playhead", "data"),
+        Output("replay-slider", "min"),
         Output("replay-slider", "max"),
         Output("replay-slider", "marks"),
         Output("replay-slider", "disabled"),
         Output("playback-message", "children"),
+        Output("map-stream-data", "data"),
+        Output("map-live-badge", "children"),
         Input("refresh-timer", "n_intervals"),
         Input("reset-track", "n_clicks"),
         Input("theme-mode", "data"),
         Input("reference-path-visible", "data"),
-        Input("terrain-enabled", "data"),
         Input("playback-revision", "data"),
         Input("recording-revision", "data"),
         Input("serial-revision", "data"),
+        Input("source-mode-revision", "data"),
         Input("view-mode", "value"),
         Input("reset-3d-view", "n_clicks"),
         State("rendered-playhead", "data"),
@@ -3471,10 +4453,10 @@ def build_dash_app(
         _reset_clicks: int,
         theme: str,
         show_reference: bool,
-        terrain_enabled: bool,
         playback_revision: Optional[dict[str, object]],
         _recording_revision: Optional[int],
         _serial_revision: Optional[int],
+        source_mode_revision: Optional[dict[str, object]],
         view_mode: str,
         camera_revision: int,
         rendered_playhead: Optional[float],
@@ -3486,10 +4468,28 @@ def build_dash_app(
                 source_manager.seek_replay(0.0)
             else:
                 store.clear_track(reset_counters=True)
+                live_dvr.reset()
 
         source_manager.tick()
         manager_status = source_manager.status()
-        points, source = store.snapshot()
+        all_points, source = store.snapshot()
+        if manager_status["mode"] == "live":
+            live_dvr.tick(all_points)
+            dvr_status = live_dvr.status(all_points)
+            points = live_dvr.visible_points(all_points)
+        else:
+            dvr_status = {
+                "at_live_edge": True,
+                "playing": True,
+                "playhead_s": 0.0,
+                "speed": 1.0,
+                "minimum_s": 0.0,
+                "live_edge_s": 0.0,
+                "behind_s": 0.0,
+                "count": 0,
+            }
+            points = all_points
+
         trajectory_points, trajectory_name = trajectory_store.snapshot()
         partial_replay = (
             manager_status["mode"] == "replay"
@@ -3530,6 +4530,25 @@ def build_dash_app(
             current = points[-1]
             ground_speed, vertical_speed = calculate_speed(points)
             ground_range = math.hypot(current.east_m, current.north_m)
+            if (
+                manager_status["mode"] == "live"
+                and not bool(dvr_status["at_live_edge"])
+            ):
+                displayed_max_up_m = max(
+                    0.0,
+                    max((point.up_m for point in points), default=0.0),
+                )
+                displayed_distance_m = sum(
+                    math.sqrt(
+                        (right.east_m - left.east_m) ** 2
+                        + (right.north_m - left.north_m) ** 2
+                        + (right.up_m - left.up_m) ** 2
+                    )
+                    for left, right in zip(points, points[1:])
+                )
+            else:
+                displayed_max_up_m = float(source["max_up_m"])
+                displayed_distance_m = float(source["distance_travelled_m"])
             phase = infer_flight_phase(points, vertical_speed)
             metric_values = (
                 f"{current.latitude_deg:.7f}",
@@ -3539,9 +4558,9 @@ def build_dash_app(
                 f"{ground_speed:.1f}",
                 f"{vertical_speed:+.1f}",
                 f"{ground_range:.1f}",
-                f"{float(source['max_up_m']):.1f}",
+                f"{displayed_max_up_m:.1f}",
                 f"{current.time_s:.1f}",
-                f"{float(source['distance_travelled_m']):.1f}",
+                f"{displayed_distance_m:.1f}",
             )
 
         chip_status = "replay" if status == "replay_complete" else status
@@ -3555,49 +4574,146 @@ def build_dash_app(
             recording_label = "REC OFF"
         live_mode = manager_status["mode"] == "live"
         demo_source = manager_status["live_kind"] == "demo"
+        real_source = manager_status["live_kind"] == "live"
         recording = bool(source["recording"])
         age_suffix = (
             ""
             if packet_age_s is None or manager_status["mode"] == "replay"
             else f" · packet age {packet_age_s:.1f} s"
         )
-        replay_loaded = (
-            bool(manager_status["loaded"])
-            and manager_status["mode"] == "replay"
-        )
-        replay_playing = bool(manager_status["playing"])
-        replay_playhead = float(manager_status["playhead_s"])
-        replay_duration = float(manager_status["duration_s"])
+        replay_loaded = bool(manager_status["loaded"]) and manager_status["mode"] == "replay"
+        if replay_loaded:
+            timeline_available = float(manager_status["duration_s"]) > 0.0
+            timeline_playing = bool(manager_status["playing"])
+            timeline_playhead = float(manager_status["playhead_s"])
+            timeline_minimum = 0.0
+            timeline_edge = float(manager_status["duration_s"])
+            timeline_at_live_edge = False
+            timeline_speed = float(manager_status["speed"])
+            timeline_name = str(manager_status["name"])
+            timeline_time_label = (
+                f"{_format_clock(timeline_playhead)} / "
+                f"{_format_clock(timeline_edge)}"
+            )
+            timeline_time_class = "replay-time"
+        elif live_mode:
+            timeline_available = len(all_points) >= 2
+            timeline_playing = bool(dvr_status["playing"])
+            timeline_playhead = float(dvr_status["playhead_s"])
+            timeline_minimum = float(dvr_status["minimum_s"])
+            timeline_edge = float(dvr_status["live_edge_s"])
+            timeline_at_live_edge = bool(dvr_status["at_live_edge"])
+            timeline_speed = float(dvr_status["speed"])
+            timeline_name = f"Live DVR buffer · {len(all_points):,} samples"
+            timeline_time_label = (
+                "LIVE"
+                if timeline_at_live_edge
+                else f"-{_format_clock(float(dvr_status['behind_s']))} / LIVE"
+            )
+            timeline_time_class = (
+                "replay-time timeline-live"
+                if timeline_at_live_edge
+                else "replay-time timeline-behind"
+            )
+        else:
+            timeline_available = False
+            timeline_playing = False
+            timeline_playhead = 0.0
+            timeline_minimum = 0.0
+            timeline_edge = 0.0
+            timeline_at_live_edge = False
+            timeline_speed = 1.0
+            timeline_name = "No live source or replay"
+            timeline_time_label = "00:00.0 / 00:00.0"
+            timeline_time_class = "replay-time"
+
         publish_playhead = (
             rendered_playhead is None
             or slider_playhead is None
             or not math.isclose(
-                replay_playhead,
+                timeline_playhead,
                 float(rendered_playhead),
                 abs_tol=1e-6,
             )
             or not math.isclose(
-                replay_playhead,
+                timeline_playhead,
                 float(slider_playhead),
                 abs_tol=1e-6,
             )
         )
-        replay_slider_value = replay_playhead if publish_playhead else no_update
-        rendered_playhead_value = replay_playhead if publish_playhead else no_update
-        replay_marks = {0.0: "0 s"}
-        if replay_duration > 0.0:
-            replay_marks[replay_duration] = f"{replay_duration:.1f} s"
+        timeline_slider_value = timeline_playhead if publish_playhead else no_update
+        rendered_playhead_value = timeline_playhead if publish_playhead else no_update
+        timeline_marks = {timeline_minimum: _format_clock(timeline_minimum)}
+        if timeline_edge > timeline_minimum:
+            timeline_marks[timeline_edge] = (
+                "LIVE" if live_mode and not replay_loaded else _format_clock(timeline_edge)
+            )
         action_feedback = str((playback_revision or {}).get("feedback", ""))
         if ctx.triggered_id != "playback-revision" or not action_feedback:
             if replay_loaded:
-                replay_state = "Playing" if replay_playing else "Paused"
+                replay_state = "Playing" if timeline_playing else "Paused"
                 action_feedback = (
                     f"{replay_state} · sample {int(manager_status['index']):,}/"
                     f"{int(manager_status['count']):,} · "
-                    f"{float(manager_status['speed']):g}×"
+                    f"{timeline_speed:g}×"
                 )
+            elif live_mode and timeline_available:
+                if timeline_at_live_edge:
+                    action_feedback = (
+                        f"LIVE · {len(all_points):,} samples retained · "
+                        "drag the timeline to rewind"
+                    )
+                else:
+                    action_feedback = (
+                        f"{float(dvr_status['behind_s']):.1f} s behind LIVE · "
+                        "receiver and recording continue"
+                    )
             else:
-                action_feedback = "Load a recorded CSV to enable playback."
+                action_feedback = "Start Demo/Real flight or load a recorded CSV."
+
+        source_choice_feedback = str(
+            (source_mode_revision or {}).get("feedback", "")
+        )
+        if ctx.triggered_id == "source-mode-revision" and source_choice_feedback:
+            source_choice_message = source_choice_feedback
+        elif manager_status["mode"] == "replay":
+            source_choice_message = (
+                "Replay is active. Choose Demo flight or Real flight to leave playback."
+            )
+        elif live_mode and not timeline_at_live_edge:
+            source_choice_message = (
+                f"DVR view · {float(dvr_status['behind_s']):.1f} s behind LIVE · "
+                "telemetry continues in the background."
+            )
+        elif live_mode and demo_source:
+            source_choice_message = (
+                "Demo flight is active · synthetic telemetry · REC starts only on request."
+            )
+        elif live_mode and real_source:
+            source_choice_message = (
+                "Real flight is active · live serial telemetry · REC starts only on request."
+            )
+        elif real_source:
+            source_choice_message = (
+                "Real flight is ready · choose a COM port and baud rate, then Connect."
+            )
+        else:
+            source_choice_message = (
+                "Choose Demo flight for a simulated mission or Real flight for COM telemetry."
+            )
+
+        if live_mode and not timeline_at_live_edge:
+            source_mode_label = "DVR"
+        elif live_mode and demo_source:
+            source_mode_label = "SIMULATION"
+        elif live_mode and real_source:
+            source_mode_label = "LIVE"
+        elif manager_status["mode"] == "replay":
+            source_mode_label = "REPLAY"
+        elif real_source:
+            source_mode_label = "SERIAL READY"
+        else:
+            source_mode_label = "CHOOSE MODE"
 
         trajectory_figure = (
             no_update
@@ -3615,36 +4731,69 @@ def build_dash_app(
                 reference_notice,
             )
         )
-        map_figure = (
-            no_update
-            if view_mode == "3d"
-            else create_map_figure(
-                points,
-                theme,
-                visible_trajectory_points,
-                source["launch_point"],
-                bool(terrain_enabled),
-                launch_label,
-                bool(show_reference and reference_available),
-                trajectory_name,
+        if points:
+            map_points = _downsample_for_display(points)
+            map_current = map_points[-1]
+            map_stream_data = {
+                "revision": (
+                    f"{manager_status['mode']}-{len(points)}-"
+                    f"{map_current.time_s:.6f}"
+                ),
+                "latitudes": [point.latitude_deg for point in map_points],
+                "longitudes": _unwrap_longitudes(
+                    [point.longitude_deg for point in map_points]
+                ),
+                "relative_up": [point.up_m for point in map_points],
+                "track_customdata": [
+                    [
+                        point.altitude_m,
+                        point.up_m,
+                        point.time_s,
+                        point.longitude_deg,
+                    ]
+                    for point in map_points
+                ],
+                "current": {
+                    "latitude_deg": map_current.latitude_deg,
+                    "longitude_deg": map_current.longitude_deg,
+                    "altitude_m": map_current.altitude_m,
+                    "up_m": map_current.up_m,
+                    "time_s": map_current.time_s,
+                    "label": f"🚀 {map_current.up_m:+,.0f} m",
+                },
+            }
+            map_live_badge = (
+                f"🚀 ROCKET  {map_current.up_m:+,.0f} m  ·  "
+                f"{map_current.time_s:.1f} s"
             )
-        )
+        else:
+            map_stream_data = {
+                "revision": f"{manager_status['mode']}-empty",
+                "latitudes": [],
+            }
+            map_live_badge = ""
 
         return (
             theme,
             "Dark mode" if theme == "light" else "Light mode",
             trajectory_figure,
-            map_figure,
             create_profile_figure(points, theme, visible_trajectory_points),
             status_label,
             chip_status,
-            (
-                "SIMULATION"
-                if live_mode and demo_source
-                else str(manager_status["mode"]).upper()
-            ),
+            source_mode_label,
             str(manager_status["source_label"]),
             message + age_suffix,
+            source_choice_message,
+            (
+                "source-choice-button source-choice-active"
+                if demo_source
+                else "source-choice-button"
+            ),
+            (
+                "source-choice-button source-choice-active"
+                if real_source
+                else "source-choice-button"
+            ),
             *metric_values,
             phase,
             f"{int(source['accepted']):,} accepted",
@@ -3659,31 +4808,189 @@ def build_dash_app(
             "button button-danger" if recording else "button button-primary",
             not live_mode,
             (
-                "Demo active"
-                if live_mode and demo_source
-                else "Live active"
+                "LIVE"
+                if live_mode and timeline_at_live_edge
+                else "Go LIVE"
                 if live_mode
                 else "Return to demo"
-                if demo_source
+                if manager_status["mode"] == "replay" and demo_source
                 else "Return to live"
+                if manager_status["mode"] == "replay" and real_source
+                else "Real flight ready"
+                if real_source
+                else "Choose mode"
             ),
-            live_mode,
-            "Pause" if replay_playing else "Play",
+            (
+                timeline_at_live_edge
+                if live_mode
+                else manager_status["mode"] != "replay"
+            ),
+            "Pause" if timeline_playing else "Play",
             (
                 "button button-danger"
-                if replay_playing
+                if timeline_playing
                 else "button button-primary"
             ),
-            not replay_loaded,
-            str(manager_status["name"]),
-            f"{_format_clock(replay_playhead)} / {_format_clock(replay_duration)}",
-            replay_slider_value,
+            not timeline_available,
+            "Buffer start" if live_mode else "Restart",
+            not timeline_available,
+            not timeline_available,
+            timeline_name,
+            timeline_time_label,
+            timeline_time_class,
+            timeline_slider_value,
             rendered_playhead_value,
-            max(0.1, replay_duration),
-            replay_marks,
-            not (replay_loaded and replay_duration > 0.0),
+            timeline_minimum,
+            max(timeline_minimum + 0.1, timeline_edge),
+            timeline_marks,
+            not timeline_available,
             action_feedback,
+            map_stream_data,
+            map_live_badge,
         )
+
+    @app.callback(
+        Output("map-graph", "figure"),
+        Input("map-refresh-timer", "n_intervals"),
+        Input("theme-mode", "data"),
+        Input("reference-path-visible", "data"),
+        Input("terrain-enabled", "data"),
+        Input("playback-revision", "data"),
+        Input("serial-revision", "data"),
+        Input("source-mode-revision", "data"),
+        Input("view-mode", "value"),
+        Input("ground-station-store", "data"),
+        Input("reset-track", "n_clicks"),
+    )
+    def update_map(
+        _interval: int,
+        theme: str,
+        show_reference: bool,
+        terrain_enabled: bool,
+        _playback_revision: Optional[dict[str, object]],
+        _serial_revision: Optional[int],
+        _source_mode_revision: Optional[dict[str, object]],
+        view_mode: str,
+        ground_station_data: Optional[dict[str, object]],
+        _reset_clicks: int,
+    ):
+        """Render MapLibre independently so its slower repaint cannot lag telemetry."""
+        if view_mode == "3d":
+            return no_update
+
+        manager_status = source_manager.status()
+        all_points, source = store.snapshot()
+        points = (
+            live_dvr.visible_points(all_points)
+            if manager_status["mode"] == "live"
+            else all_points
+        )
+
+        ground_station: Optional[GroundStationLocation] = None
+        if isinstance(ground_station_data, dict):
+            try:
+                ground_station = parse_ground_station_location(
+                    ground_station_data.get("latitude_deg"),
+                    ground_station_data.get("longitude_deg"),
+                    ground_station_data.get("altitude_m"),
+                    ground_station_data.get("accuracy_m"),
+                    ground_station_data.get("source", "manual"),
+                )
+            except (TypeError, ValueError):
+                ground_station = None
+
+        trajectory_points, trajectory_name = trajectory_store.snapshot()
+        partial_replay = (
+            manager_status["mode"] == "replay"
+            and not bool(manager_status["launch_known"])
+        )
+        reference_available = not partial_replay or bool(trajectory_points)
+        visible_trajectory_points = trajectory_points if show_reference else []
+        launch_label = "Replay start" if partial_replay else "Launch"
+        selected_theme = theme if theme in FIGURE_THEMES else "dark"
+
+        figure = create_map_figure(
+            points,
+            selected_theme,
+            visible_trajectory_points,
+            source["launch_point"],
+            bool(terrain_enabled),
+            launch_label,
+            bool(show_reference and reference_available),
+            trajectory_name,
+            ground_station,
+            map_empty_state_message(
+                manager_status["mode"],
+                manager_status["live_kind"],
+                max(0, int(_interval or 0))
+                * MAP_REFRESH_INTERVAL_MS
+                / 1_000.0,
+            ),
+        )
+        return figure
+
+    app.clientside_callback(
+        """
+        function(payload) {
+            if (!payload || !payload.current) {
+                return window.dash_clientside.no_update;
+            }
+            if (!window.Plotly) {
+                return window.dash_clientside.no_update;
+            }
+            const graphWrapper = document.getElementById("map-graph");
+            const graph = graphWrapper
+                ? graphWrapper.querySelector(".js-plotly-plot")
+                : null;
+            if (!graph || !Array.isArray(graph.data)) {
+                return window.dash_clientside.no_update;
+            }
+            const trackIndex = graph.data.findIndex(
+                (trace) => trace && trace.name === "Ground track"
+            );
+            const currentIndex = graph.data.findIndex(
+                (trace) => trace && trace.name === "Current"
+            );
+            if (trackIndex < 0 || currentIndex < 0) {
+                return window.dash_clientside.no_update;
+            }
+            try {
+                window.Plotly.restyle(
+                    graph,
+                    {
+                        lat: [payload.latitudes],
+                        lon: [payload.longitudes],
+                        customdata: [payload.track_customdata],
+                        "marker.color": [payload.relative_up]
+                    },
+                    [trackIndex]
+                );
+                const current = payload.current;
+                window.Plotly.restyle(
+                    graph,
+                    {
+                        lat: [[current.latitude_deg]],
+                        lon: [[current.longitude_deg]],
+                        text: [[current.label]],
+                        customdata: [[[
+                            current.longitude_deg,
+                            current.altitude_m,
+                            current.up_m,
+                            current.time_s
+                        ]]]
+                    },
+                    [currentIndex]
+                );
+            } catch (error) {
+                return window.dash_clientside.no_update;
+            }
+            return payload.revision;
+        }
+        """,
+        Output("map-stream-applied", "data"),
+        Input("map-stream-data", "data"),
+        prevent_initial_call=True,
+    )
 
     return app
 
@@ -3729,7 +5036,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Use a synthetic flight instead of a serial port",
+        help="Advanced: start the synthetic flight immediately",
     )
     parser.add_argument(
         "--no-browser",
@@ -3769,23 +5076,32 @@ def main() -> None:
         live_source_factory = create_demo_source_factory(store)
         source_label = "DEMO source / synthetic 78-byte HYI packet model"
         live_kind = "demo"
+        initial_mode = "live"
     else:
         live_source_factory = lambda: SerialReceiver(
             store, args.serial_port, args.baud
         )
-        source_label = f"Serial source / {args.serial_port} / {args.baud} baud"
-        live_kind = "live"
+        source_label = "Choose Demo flight or Real flight"
+        live_kind = "idle"
+        initial_mode = "idle"
 
     source_manager = SourceManager(
         store,
         live_source_factory,
         source_label,
         live_kind=live_kind,
-        serial_port=None if args.demo else args.serial_port,
-        baud_rate=None if args.demo else args.baud,
+        serial_port=args.serial_port,
+        baud_rate=args.baud,
+        initial_mode=initial_mode,
     )
     trajectory_store = TrajectoryStore()
-    source_manager.start_live()
+    if args.demo:
+        source_manager.start_live()
+    else:
+        store.set_status(
+            "waiting",
+            "Choose Demo flight or Real flight to begin",
+        )
     atexit.register(source_manager.stop)
 
     app = build_dash_app(

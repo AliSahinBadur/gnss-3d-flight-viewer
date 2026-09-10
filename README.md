@@ -1,4 +1,4 @@
-# Rocket Flight Viewer v3
+# Proist Roket Takımı Bilimsel Görev Yazılımı
 
 A local Dash dashboard for live HYI GNSS telemetry, flight recording and replay,
 custom reference trajectories, and synchronized 3D/2D visualization.
@@ -8,8 +8,15 @@ custom reference trajectories, and synchronized 3D/2D visualization.
 - Live serial input for the existing 78-byte HYI packet, with automatic reconnect
   and runtime port/baud selectors.
 - Built-in demo flight for setup and UI checks without hardware.
+- Serial port and baud controls appear only in `Real flight`; Demo mode never
+  exposes or opens a COM port.
+- Ground-station location from the browser/Windows location service, with a
+  manual latitude, longitude, and altitude fallback when permission or a fix is
+  unavailable.
 - Bounded in-memory recording and one-click export to a replayable CSV file.
-- Replay controls: play/pause, restart, seek, and 0.25x to 10x speed.
+- A live DVR timeline: inspect an earlier moment while reception and an active
+  recording continue, then select `LIVE` to jump to the newest packet.
+- Saved-file replay controls: play/pause, restart, seek, and 0.25x to 10x speed.
 - Interactive WGS84/ECEF-to-ENU 3D flight corridor with a rocket marker.
 - Open-by-default pitched OpenStreetMap ground track with real DEM terrain and
   hillshade; no map token is required and a flat-map fallback is included.
@@ -41,32 +48,36 @@ If PowerShell blocks venv activation, the interpreter can be called directly:
 ```
 
 For PyCharm, open this repository folder as the project and select the `.venv`
-interpreter. The included `Rocket Flight Viewer - Demo` and
-`Rocket Flight Viewer - Serial` run configurations then provide one-click startup
-on port 8071.
+interpreter once. Then select the included `Rocket Flight Viewer` configuration and
+press **Run**. No program parameters are required. The browser opens on port 8071
+and the dashboard asks whether to use `Demo flight` or `Real flight`.
 
-## Start without hardware
+Demo and Real flight are not separate programs or Git branches. They are two data
+sources inside the same `gnss_3d_visualizer.py` application and share the same
+dashboard, maps, recording, replay, and trajectory tools.
 
-```powershell
-.\.venv\Scripts\python.exe gnss_3d_visualizer.py --demo
-```
-
-The dashboard opens at <http://127.0.0.1:8050>. Use `--no-browser` when the app
-should not open a browser automatically. Demo points are synthetic and are marked
-`DEMO` throughout the interface; they are never receiver measurements. Opening a
-replay pauses their display. `Return to demo` clears the replay plot before the
-synthetic source resumes; it never restores the pre-replay flight path.
-
-## Start with a serial receiver
+## Start the application
 
 ```powershell
-.\.venv\Scripts\python.exe gnss_3d_visualizer.py --serial-port COM7 --baud 19200
+.\.venv\Scripts\python.exe gnss_3d_visualizer.py
 ```
+
+The dashboard opens at <http://127.0.0.1:8071> without starting a telemetry source.
+Select `Demo flight` to start a fresh synthetic mission without hardware. Demo
+points are marked `DEMO` throughout the interface and are never receiver
+measurements. The COM port and baud controls are hidden in this mode. Select
+`Real flight` to reveal those controls, choose the port and baud rate, and then
+select `Connect` to start real telemetry. Switching modes clears the displayed
+track and always leaves recording off.
+
+Command-line options remain available for advanced or automated use, but they are
+not needed for normal PyCharm operation. For example, `--demo` starts the synthetic
+source immediately and `--no-browser` prevents automatic browser opening.
 
 Useful options:
 
 ```text
---http-port 8050       Dashboard port
+--http-port 8071       Dashboard port
 --max-points 20000     Number of live/recording points retained in memory
 --max-speed 3000       Reject physically implausible 3D jumps (m/s); 0 disables
 --stale-timeout 2.0    Mark the stream stale after this many seconds
@@ -76,7 +87,23 @@ Run `python gnss_3d_visualizer.py --help` for the complete command reference.
 The `SERIAL` controls in the command bar list detected ports, retain the configured
 port when it is temporarily unplugged, and apply a new port/baud only when
 `Connect` is selected. Use `Ports ↻` after plugging in a receiver. The app never
-silently switches to another detected port.
+silently switches to another detected port. These controls are shown only after
+`Real flight` is selected; Demo and saved-file replay do not need serial settings.
+
+## Ground-station location
+
+When the dashboard opens, it asks the browser for the computer's current location
+and marks an accepted fix as `Ground station` on the map. This uses the browser and
+Windows location service rather than the rocket receiver. The browser may request
+permission, and a desktop estimate can be less accurate than a GNSS fix. Open the
+compact `Yer istasyonu` popover from the upper-right header to see or change it.
+
+If permission is denied, the request times out, or no position is available, enter
+the ground-station latitude and longitude in the popover and select `Konumu kaydet`.
+Altitude is optional because browsers frequently do not provide it. `Bilgisayardan
+al` requests a fresh automatic fix. The ground-station marker is independent of the
+launch datum, so changing it does not rotate, translate, or rewrite recorded rocket
+telemetry and reference trajectories.
 
 ## Record and replay
 
@@ -84,13 +111,22 @@ silently switches to another detected port.
 2. Select `Stop recording`, then `Export CSV`.
 3. Later, choose `Load replay CSV` and select the exported file.
 4. Use Play/Pause, Restart, the timeline, and the speed selector. `Return to live`
-   clears the displayed flight and reconnects the configured live source.
+   or `Return to demo` leaves saved-file replay and reconnects the previously
+   selected source.
+
+The live DVR timeline is separate from saved-file replay. While a live or Demo
+source is running, drag its timeline backward to inspect buffered telemetry. The
+viewer shows `BEHIND LIVE`, but the serial/demo receiver keeps accepting new
+packets in the background. If `REC ON` is active, recording also continues without
+gaps. Select `LIVE` to jump directly to the newest buffered packet; this does not
+disconnect the receiver, start a new flight, or toggle recording. The rolling DVR
+history is bounded by `--max-points`, so its oldest samples eventually expire.
 
 Recording is strict opt-in: only fixes received after `Start recording` are added
-to the export buffer. `Return to live` never restores the old live or replay path;
-it reconnects the receiver with a clean plot and leaves recording stopped. A new
-flight appears only after the receiver supplies a new fix. `REC OFF` and `REC ON`
-are shown explicitly.
+to the export buffer. Returning from replay never restores the old live or replay
+path; it restarts the previously selected source with a clean plot and leaves
+recording stopped. A new real flight appears only after the receiver supplies a new
+fix. `REC OFF` and `REC ON` are shown explicitly.
 Previously saved points can still be exported while the indicator says
 `REC OFF · N saved`. Recording is capped by `--max-points`, preventing an
 unattended session from growing memory indefinitely. Uploaded CSV files are limited

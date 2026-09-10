@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Rocket Flight Viewer - Serial" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="Rocket Flight Viewer" type="PythonConfigurationType" factoryName="Python">
     <module name="gnss-3d-flight-viewer" />
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <option name="RUN_TOOL" value="" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/gnss_3d_visualizer.py" />
-    <option name="PARAMETERS" value="--http-port 8071" />
+    <option name="PARAMETERS" value="" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

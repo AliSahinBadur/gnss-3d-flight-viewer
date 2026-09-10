@@ -1,6 +1,7 @@
 import struct
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
@@ -8,10 +9,13 @@ from unittest.mock import patch
 import gnss_3d_visualizer as viewer
 
 from gnss_3d_visualizer import (
+    APP_NAME,
     FOOTER,
     HEADER,
     DemoReceiver,
+    GroundStationLocation,
     HYIPacketDecoder,
+    LiveDvrController,
     MIN_SCENE_AXIS_RATIO,
     MAX_POINT_CAPACITY,
     MAX_RENDER_POINTS,
@@ -42,6 +46,7 @@ from gnss_3d_visualizer import (
     normalize_serial_port,
     packet_checksum,
     parse_arguments,
+    parse_ground_station_location,
     parse_hyi_packet,
     representative_trajectory_coordinates,
     serial_baud_options,
@@ -67,6 +72,63 @@ def make_packet(
     packet[-2:] = FOOTER
     packet[75] = packet_checksum(packet)
     return bytes(packet)
+
+
+def make_telemetry_points(*times_s: float) -> list[TelemetryPoint]:
+    return [
+        TelemetryPoint(
+            time_s=float(time_s),
+            epoch_s=1_700_000_000.0 + float(time_s),
+            packet_counter=index,
+            latitude_deg=40.0 + index * 0.00001,
+            longitude_deg=29.0 + index * 0.00001,
+            altitude_m=100.0 + index,
+            east_m=float(index),
+            north_m=float(index) * 2.0,
+            up_m=float(index),
+        )
+        for index, time_s in enumerate(times_s)
+    ]
+
+
+def find_layout_component(component, component_id: str):
+    if getattr(component, "id", None) == component_id:
+        return component
+    children = getattr(component, "children", None)
+    if isinstance(children, (list, tuple)):
+        for child in children:
+            found = find_layout_component(child, component_id)
+            if found is not None:
+                return found
+    elif children is not None and not isinstance(children, (str, int, float)):
+        return find_layout_component(children, component_id)
+    return None
+
+
+def layout_text(component) -> list[str]:
+    children = getattr(component, "children", None)
+    if isinstance(component, str):
+        return [component]
+    if isinstance(children, (list, tuple)):
+        result: list[str] = []
+        for child in children:
+            result.extend(layout_text(child))
+        return result
+    if isinstance(children, str):
+        return [children]
+    if children is not None:
+        return layout_text(children)
+    return []
+
+
+def component_is_hidden(component) -> bool:
+    class_name = str(getattr(component, "className", "") or "").lower()
+    style = getattr(component, "style", None) or {}
+    return bool(
+        getattr(component, "hidden", False)
+        or style.get("display") == "none"
+        or "hidden" in class_name
+    )
 
 
 class HYIPacketTests(unittest.TestCase):
@@ -823,7 +885,302 @@ class GeometryAndStoreTests(unittest.TestCase):
         self.assertEqual([point.time_s for point in recorded], [1.0])
 
 
+class LiveDvrControllerTests(unittest.TestCase):
+    def test_initial_state_follows_the_live_edge(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        points = make_telemetry_points(0.0, 1.0, 2.0)
+
+        status = controller.status(points)
+
+        self.assertTrue(status["at_live_edge"])
+        self.assertTrue(status["playing"])
+        self.assertEqual(status["minimum_s"], 0.0)
+        self.assertEqual(status["live_edge_s"], 2.0)
+        self.assertEqual(status["playhead_s"], 2.0)
+        self.assertEqual(controller.visible_points(points), points)
+
+    def test_seek_uses_a_historical_prefix_while_new_live_points_accumulate(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        original = make_telemetry_points(0.0, 1.0, 2.0)
+        controller.seek(1.0, original)
+
+        extended = make_telemetry_points(0.0, 1.0, 2.0, 3.0)
+        visible = controller.visible_points(extended)
+        status = controller.status(extended)
+
+        self.assertEqual([point.time_s for point in visible], [0.0, 1.0])
+        self.assertFalse(status["at_live_edge"])
+        self.assertEqual(status["playhead_s"], 1.0)
+        self.assertEqual(status["live_edge_s"], 3.0)
+
+    def test_seek_does_not_stop_or_restart_the_active_live_source(self):
+        class TrackingSource:
+            def __init__(self):
+                self.started = 0
+                self.stopped = 0
+
+            def start(self):
+                self.started += 1
+
+            def stop(self):
+                self.stopped += 1
+
+            def is_alive(self):
+                return True
+
+        store = TelemetryStore()
+        source = TrackingSource()
+        manager = SourceManager(store, lambda: source, "Live source")
+        manager._live_source = source
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+
+        controller.seek(1.0, make_telemetry_points(0.0, 1.0, 2.0))
+
+        self.assertEqual(manager.status()["mode"], "live")
+        self.assertIs(manager._live_source, source)
+        self.assertEqual(source.started, 0)
+        self.assertEqual(source.stopped, 0)
+
+    def test_go_live_snaps_to_latest_without_discarding_history(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        points = make_telemetry_points(0.0, 1.0, 2.0, 3.0)
+        controller.seek(1.0, points)
+
+        controller.go_live(points)
+        status = controller.status(points)
+
+        self.assertTrue(status["at_live_edge"])
+        self.assertEqual(status["playhead_s"], 3.0)
+        self.assertEqual(controller.visible_points(points), points)
+
+    def test_seek_clamps_to_the_retained_live_window(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        retained = make_telemetry_points(10.0, 11.0, 12.0)
+
+        controller.seek(-100.0, retained)
+        earliest_status = controller.status(retained)
+        self.assertEqual(earliest_status["playhead_s"], 10.0)
+        self.assertEqual(
+            [point.time_s for point in controller.visible_points(retained)],
+            [10.0],
+        )
+
+        controller.seek(100.0, retained)
+        latest_status = controller.status(retained)
+        self.assertEqual(latest_status["playhead_s"], 12.0)
+        self.assertTrue(latest_status["at_live_edge"])
+
+    def test_timeshift_playback_advances_at_selected_speed_and_catches_live(self):
+        now = [100.0]
+        controller = LiveDvrController(time_fn=lambda: now[0])
+        points = make_telemetry_points(0.0, 1.0, 2.0, 3.0)
+        controller.seek(0.5, points)
+        controller.set_speed(2.0)
+
+        self.assertTrue(controller.status(points)["playing"])
+        now[0] += 0.5
+        controller.tick(points)
+        self.assertAlmostEqual(controller.status(points)["playhead_s"], 1.5)
+
+        now[0] += 10.0
+        controller.tick(points)
+        status = controller.status(points)
+        self.assertTrue(status["at_live_edge"])
+        self.assertEqual(status["playhead_s"], 3.0)
+
+    def test_timeshift_toggle_pauses_and_resumes_without_affecting_ingestion(self):
+        now = [100.0]
+        controller = LiveDvrController(time_fn=lambda: now[0])
+        points = make_telemetry_points(0.0, 1.0, 2.0, 3.0)
+        controller.seek(1.0, points)
+
+        self.assertFalse(controller.toggle(points))
+        now[0] += 1.0
+        controller.tick(points)
+        self.assertEqual(controller.status(points)["playhead_s"], 1.0)
+
+        self.assertTrue(controller.toggle(points))
+        now[0] += 0.5
+        controller.tick(points)
+        self.assertAlmostEqual(controller.status(points)["playhead_s"], 1.5)
+
+    def test_pausing_at_live_edge_stays_detached_as_new_points_arrive(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        points = make_telemetry_points(0.0, 1.0, 2.0)
+        self.assertTrue(controller.status(points)["at_live_edge"])
+
+        self.assertFalse(controller.toggle(points))
+        paused_status = controller.status(points)
+        self.assertFalse(paused_status["at_live_edge"])
+        self.assertFalse(paused_status["playing"])
+        self.assertEqual(paused_status["playhead_s"], 2.0)
+
+        extended = make_telemetry_points(0.0, 1.0, 2.0, 3.0)
+        behind_status = controller.status(extended)
+        self.assertFalse(behind_status["at_live_edge"])
+        self.assertFalse(behind_status["playing"])
+        self.assertEqual(behind_status["playhead_s"], 2.0)
+        self.assertEqual(behind_status["behind_s"], 1.0)
+        self.assertEqual(
+            [point.time_s for point in controller.visible_points(extended)],
+            [0.0, 1.0, 2.0],
+        )
+
+    def test_reset_discards_timeshift_state_and_handles_an_empty_buffer(self):
+        controller = LiveDvrController(time_fn=lambda: 100.0)
+        points = make_telemetry_points(0.0, 1.0, 2.0)
+        controller.seek(1.0, points)
+        controller.toggle(points)
+
+        controller.reset()
+        status = controller.status([])
+
+        self.assertTrue(status["at_live_edge"])
+        self.assertTrue(status["playing"])
+        self.assertEqual(status["playhead_s"], 0.0)
+        self.assertEqual(status["minimum_s"], 0.0)
+        self.assertEqual(status["live_edge_s"], 0.0)
+        self.assertEqual(controller.visible_points([]), [])
+
+
 class SerialSettingsTests(unittest.TestCase):
+    def test_idle_start_waits_for_a_web_source_choice(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose Demo flight or Real flight",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        status = manager.status()
+        self.assertEqual(status["mode"], "idle")
+        self.assertEqual(status["live_kind"], "idle")
+        self.assertFalse(status["source_selected"])
+        self.assertTrue(status["serial_configurable"])
+        self.assertFalse(manager.toggle_recording())
+        self.assertFalse(store.snapshot()[1]["recording"])
+
+    def test_demo_selection_starts_fresh_source_and_keeps_serial_settings(self):
+        class DemoSource:
+            def __init__(self):
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                return None
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+        store = TelemetryStore()
+        source = DemoSource()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose Demo flight or Real flight",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        with patch.object(
+            viewer,
+            "create_demo_source_factory",
+            return_value=lambda: source,
+        ):
+            manager.activate_demo()
+
+        status = manager.status()
+        self.assertTrue(source.started)
+        self.assertEqual(status["mode"], "live")
+        self.assertEqual(status["live_kind"], "demo")
+        self.assertEqual(status["serial_port"], "COM9")
+        self.assertEqual(status["baud_rate"], 19_200)
+        self.assertFalse(store.snapshot()[1]["recording"])
+
+    def test_real_flight_selection_waits_for_connect(self):
+        class DemoSource:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+        store = TelemetryStore()
+        store.start_recording()
+        source = DemoSource()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Demo source",
+            live_kind="demo",
+            serial_port="COM9",
+            baud_rate=19_200,
+        )
+        manager._live_source = source
+
+        selected = manager.select_serial_mode(" COM5 ", 115_200)
+
+        self.assertEqual(selected, ("COM5", 115_200))
+        self.assertTrue(source.stopped)
+        self.assertIsNone(manager._live_source)
+        status = manager.status()
+        self.assertEqual(status["mode"], "idle")
+        self.assertEqual(status["live_kind"], "live")
+        self.assertEqual(status["serial_port"], "COM5")
+        self.assertEqual(status["baud_rate"], 115_200)
+        self.assertTrue(status["serial_configurable"])
+        self.assertFalse(store.snapshot()[1]["recording"])
+
+    def test_demo_mode_rejects_a_direct_serial_connect_attempt(self):
+        class DemoSource:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+            def is_alive(self):
+                return True
+
+        store = TelemetryStore()
+        demo_source = DemoSource()
+        manager = SourceManager(
+            store,
+            lambda: demo_source,
+            "Demo source",
+            live_kind="demo",
+            serial_port="COM9",
+            baud_rate=19_200,
+        )
+        manager._live_source = demo_source
+
+        with self.assertRaisesRegex(RuntimeError, "Real flight"):
+            manager.configure_serial("COM5", 115_200)
+
+        self.assertFalse(demo_source.stopped)
+        self.assertIs(manager._live_source, demo_source)
+        self.assertEqual(manager.status()["mode"], "live")
+        self.assertEqual(manager.status()["live_kind"], "demo")
+        self.assertEqual(manager.status()["serial_port"], "COM9")
+        self.assertEqual(manager.status()["baud_rate"], 19_200)
+
     def test_serial_settings_are_normalized_and_bounded(self):
         self.assertEqual(normalize_serial_port("  COM7  "), "COM7")
         self.assertEqual(normalize_baud_rate("115200"), 115_200)
@@ -918,6 +1275,134 @@ class SerialSettingsTests(unittest.TestCase):
         manager.stop()
 
 
+class GroundStationLocationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        load_dashboard_dependencies()
+
+    def test_manual_location_parser_accepts_strings_and_optional_metadata(self):
+        location = parse_ground_station_location(
+            "40.9621053",
+            "29.1294180",
+            altitude="1400.5",
+            accuracy="7.25",
+            source="manual",
+        )
+
+        self.assertIsInstance(location, GroundStationLocation)
+        self.assertAlmostEqual(location.latitude_deg, 40.9621053)
+        self.assertAlmostEqual(location.longitude_deg, 29.1294180)
+        self.assertAlmostEqual(location.altitude_m, 1400.5)
+        self.assertAlmostEqual(location.accuracy_m, 7.25)
+        self.assertEqual(location.source, "manual")
+
+    def test_location_parser_allows_missing_altitude_and_computer_accuracy(self):
+        location = parse_ground_station_location(
+            0.0,
+            0.0,
+            altitude=None,
+            accuracy=18.0,
+            source="computer",
+        )
+
+        self.assertEqual(location.latitude_deg, 0.0)
+        self.assertEqual(location.longitude_deg, 0.0)
+        self.assertIsNone(location.altitude_m)
+        self.assertEqual(location.accuracy_m, 18.0)
+        self.assertEqual(location.source, "computer")
+
+    def test_location_parser_rejects_invalid_coordinates_without_coercing_them(self):
+        invalid_locations = (
+            (None, 29.0),
+            ("", 29.0),
+            (float("nan"), 29.0),
+            (float("inf"), 29.0),
+            (90.00001, 29.0),
+            (-90.00001, 29.0),
+            (40.0, 180.00001),
+            (40.0, -180.00001),
+        )
+        for latitude, longitude in invalid_locations:
+            with self.subTest(latitude=latitude, longitude=longitude):
+                with self.assertRaises(ValueError):
+                    parse_ground_station_location(latitude, longitude)
+
+    def test_location_parser_rejects_invalid_optional_measurements(self):
+        for field, value in (
+            ("altitude", float("nan")),
+            ("altitude", float("inf")),
+            ("accuracy", float("nan")),
+            ("accuracy", -0.1),
+        ):
+            with self.subTest(field=field, value=value):
+                kwargs = {field: value}
+                with self.assertRaises(ValueError):
+                    parse_ground_station_location(40.0, 29.0, **kwargs)
+
+    def test_empty_map_centers_on_ground_station_and_draws_one_marker(self):
+        station = GroundStationLocation(
+            latitude_deg=40.75,
+            longitude_deg=29.25,
+            altitude_m=None,
+            accuracy_m=12.0,
+            source="computer",
+        )
+
+        figure = create_map_figure([], ground_station=station)
+        station_traces = [
+            trace for trace in figure.data if trace.name == "Ground station"
+        ]
+
+        self.assertEqual(len(station_traces), 1)
+        self.assertAlmostEqual(station_traces[0].lat[0], station.latitude_deg)
+        self.assertAlmostEqual(station_traces[0].lon[0], station.longitude_deg)
+        self.assertAlmostEqual(figure.layout.map.center.lat, station.latitude_deg)
+        self.assertAlmostEqual(figure.layout.map.center.lon, station.longitude_deg)
+
+    def test_ground_station_is_included_in_map_extent_with_a_live_track(self):
+        points = make_telemetry_points(0.0, 1.0)
+        station = GroundStationLocation(
+            latitude_deg=40.02,
+            longitude_deg=29.02,
+            altitude_m=110.0,
+            accuracy_m=None,
+            source="manual",
+        )
+
+        figure = create_map_figure(points, ground_station=station)
+        expected_zoom = _map_zoom(
+            [point.latitude_deg for point in points] + [station.latitude_deg],
+            [point.longitude_deg for point in points] + [station.longitude_deg],
+        )
+
+        self.assertAlmostEqual(figure.layout.map.zoom, expected_zoom)
+        self.assertEqual(
+            sum(trace.name == "Ground station" for trace in figure.data),
+            1,
+        )
+
+    def test_ground_station_does_not_replace_the_rocket_launch_fix(self):
+        points = make_telemetry_points(0.0, 1.0)
+        launch = points[0]
+        station = GroundStationLocation(
+            latitude_deg=41.0,
+            longitude_deg=30.0,
+            altitude_m=None,
+            accuracy_m=None,
+            source="manual",
+        )
+
+        figure = create_map_figure(
+            points,
+            launch_point=launch,
+            ground_station=station,
+        )
+        launch_trace = next(trace for trace in figure.data if trace.name == "Launch")
+
+        self.assertAlmostEqual(launch_trace.lat[0], launch.latitude_deg)
+        self.assertAlmostEqual(launch_trace.lon[0], launch.longitude_deg)
+
+
 class MapAndFormattingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -975,6 +1460,60 @@ class MapAndFormattingTests(unittest.TestCase):
         self.assertEqual(center, 29.0)
         self.assertEqual(_map_zoom([40.0, 40.001], [29.0, 29.0]), 16.5)
 
+    def test_live_map_advances_current_marker_track_and_altitude_label(self):
+        first = TelemetryPoint(
+            time_s=0.0,
+            epoch_s=1_000.0,
+            packet_counter=0,
+            latitude_deg=40.9621053,
+            longitude_deg=29.1294180,
+            altitude_m=1_400.0,
+            east_m=0.0,
+            north_m=0.0,
+            up_m=0.0,
+        )
+        current_point = TelemetryPoint(
+            time_s=5.0,
+            epoch_s=1_005.0,
+            packet_counter=40,
+            latitude_deg=40.9622053,
+            longitude_deg=29.1296180,
+            altitude_m=1_700.0,
+            east_m=16.8,
+            north_m=11.1,
+            up_m=300.0,
+        )
+
+        first_figure = create_map_figure([first])
+        figure = create_map_figure([first, current_point])
+        current = next(trace for trace in figure.data if trace.name == "Current")
+        ground_track = next(
+            trace for trace in figure.data if trace.name == "Ground track"
+        )
+
+        self.assertEqual(list(current.lat), [current_point.latitude_deg])
+        self.assertEqual(list(current.lon), [current_point.longitude_deg])
+        self.assertEqual(current.mode, "markers+text")
+        self.assertIn("+300 m", current.text[0])
+        self.assertEqual(
+            list(current.customdata[0]),
+            [
+                current_point.longitude_deg,
+                current_point.altitude_m,
+                current_point.up_m,
+                current_point.time_s,
+            ],
+        )
+        self.assertIn("Relative up", current.hovertemplate)
+        self.assertEqual(len(ground_track.lat), 2)
+        self.assertEqual(ground_track.lat[-1], current_point.latitude_deg)
+        self.assertEqual(ground_track.lon[-1], current_point.longitude_deg)
+        self.assertNotEqual(
+            first_figure.layout.datarevision,
+            figure.layout.datarevision,
+        )
+        self.assertEqual(first_figure.layout.uirevision, figure.layout.uirevision)
+
     def test_terrain_map_uses_dem_hillshade_and_pitched_camera(self):
         figure = create_map_figure([], terrain_enabled=True)
         style = figure.layout.map.style
@@ -997,8 +1536,46 @@ class MapAndFormattingTests(unittest.TestCase):
         self.assertGreater(figure.layout.map.zoom, 10.0)
         self.assertEqual(
             figure.layout.annotations[0].text,
-            "Waiting for a live GNSS fix",
+            "Konum verisi bekleniyor…",
         )
+
+    def test_empty_map_message_matches_the_selected_source(self):
+        self.assertEqual(
+            viewer.map_empty_state_message("live", "demo"),
+            "Demo telemetrisi başlatılıyor…",
+        )
+        self.assertEqual(
+            viewer.map_empty_state_message("live", "live"),
+            "İlk GNSS konumu bekleniyor…",
+        )
+        self.assertEqual(
+            viewer.map_empty_state_message("idle", "live"),
+            "COM portunu seçip Connect'e bas",
+        )
+        self.assertEqual(
+            viewer.map_empty_state_message("idle", "idle"),
+            "Demo veya Gerçek Uçuş seç",
+        )
+        self.assertIsNone(
+            viewer.map_empty_state_message(
+                "idle",
+                "idle",
+                viewer.MODE_SELECTION_PROMPT_TIMEOUT_S,
+            )
+        )
+        self.assertEqual(
+            viewer.map_empty_state_message("live", "demo", 60.0),
+            "Demo telemetrisi başlatılıyor…",
+        )
+        self.assertEqual(
+            viewer.map_empty_state_message("idle", "live", 60.0),
+            "COM portunu seçip Connect'e bas",
+        )
+
+    def test_empty_map_can_hide_expired_mode_selection_prompt(self):
+        figure = create_map_figure([], empty_state_text=None)
+
+        self.assertFalse(figure.layout.annotations)
 
     def test_empty_map_uses_persistent_launch_as_terrain_center(self):
         launch = TelemetryPoint(
@@ -1256,13 +1833,196 @@ class MapAndFormattingTests(unittest.TestCase):
         visit(app.layout)
         self.assertTrue(
             {
+                "source-demo",
+                "source-live",
                 "serial-port-select",
                 "serial-baud-select",
                 "serial-refresh",
                 "serial-connect",
+                "serial-control-group",
+                "ground-station-toggle",
+                "ground-station-popover",
+                "ground-station-close",
+                "ground-station-geolocation",
+                "ground-station-store",
+                "ground-station-latitude",
+                "ground-station-longitude",
+                "ground-station-altitude",
+                "ground-station-auto",
+                "ground-station-apply",
+                "ground-station-status",
                 "fullscreen-toggle",
             }.issubset(component_ids)
         )
+
+    def test_dashboard_uses_the_proist_product_name(self):
+        expected_name = "Proist Roket Takımı Bilimsel Görev Yazılımı"
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose flight mode",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+        visible_text = layout_text(app.layout)
+
+        self.assertEqual(APP_NAME, expected_name)
+        self.assertEqual(app.title, expected_name)
+        self.assertIn(expected_name, visible_text)
+        self.assertNotIn("Rocket Flight Viewer v3", visible_text)
+
+    def test_ground_station_form_starts_in_a_compact_header_popover(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose flight mode",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+        trigger = find_layout_component(app.layout, "ground-station-toggle")
+        popover = find_layout_component(app.layout, "ground-station-popover")
+        close = find_layout_component(app.layout, "ground-station-close")
+
+        self.assertIsNotNone(trigger)
+        self.assertIn("station-popup-trigger", trigger.className)
+        trigger_props = trigger.to_plotly_json()["props"]
+        self.assertEqual(
+            trigger_props["aria-controls"], "ground-station-popover"
+        )
+        self.assertEqual(trigger_props["aria-haspopup"], "dialog")
+        self.assertIsNotNone(popover)
+        self.assertTrue(component_is_hidden(popover))
+        self.assertIn("ground-station-popover", popover.className)
+        self.assertEqual(popover.role, "dialog")
+        self.assertIsNotNone(close)
+        for component_id in (
+            "ground-station-latitude",
+            "ground-station-longitude",
+            "ground-station-altitude",
+            "ground-station-auto",
+            "ground-station-apply",
+            "ground-station-status",
+        ):
+            with self.subTest(component_id=component_id):
+                self.assertIsNotNone(
+                    find_layout_component(popover, component_id)
+                )
+        self.assertIn("ground-station-popover.hidden", app.callback_map)
+
+    def test_map_hides_the_unsupported_external_tile_snapshot_button(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose flight mode",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+        map_graph = find_layout_component(app.layout, "map-graph")
+        trajectory_graph = find_layout_component(app.layout, "trajectory-graph")
+
+        self.assertIn("toImage", map_graph.config["modeBarButtonsToRemove"])
+        self.assertNotIn(
+            "toImage", trajectory_graph.config["modeBarButtonsToRemove"]
+        )
+
+    def test_map_registers_an_independent_browser_side_live_stream(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Choose flight mode",
+            live_kind="idle",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+
+        self.assertIsNotNone(find_layout_component(app.layout, "map-graph-host"))
+        self.assertIsNotNone(find_layout_component(app.layout, "map-live-badge"))
+        self.assertIsNotNone(find_layout_component(app.layout, "map-stream-data"))
+        self.assertIsNotNone(find_layout_component(app.layout, "map-stream-applied"))
+        map_timer = find_layout_component(app.layout, "map-refresh-timer")
+        self.assertEqual(map_timer.interval, 2_000)
+        self.assertIn("map-graph.figure", app.callback_map)
+        self.assertIn("map-stream-applied.data", app.callback_map)
+        client_callback = next(
+            callback
+            for callback in app._callback_list
+            if callback["output"] == "map-stream-applied.data"
+        )
+        self.assertIsNotNone(client_callback["clientside_function"])
+
+    def test_demo_layout_hides_and_disables_all_serial_controls(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Demo source",
+            live_kind="demo",
+            serial_port="COM9",
+            baud_rate=19_200,
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+        wrapper = find_layout_component(app.layout, "serial-control-group")
+
+        self.assertIsNotNone(wrapper)
+        self.assertTrue(component_is_hidden(wrapper))
+        for component_id in (
+            "serial-port-select",
+            "serial-baud-select",
+            "serial-refresh",
+            "serial-connect",
+        ):
+            with self.subTest(component_id=component_id):
+                component = find_layout_component(app.layout, component_id)
+                self.assertIsNotNone(component)
+                self.assertTrue(component.disabled)
+
+    def test_real_flight_layout_shows_and_enables_serial_controls(self):
+        store = TelemetryStore()
+        manager = SourceManager(
+            store,
+            lambda: None,
+            "Real flight ready",
+            live_kind="live",
+            serial_port="COM9",
+            baud_rate=19_200,
+            initial_mode="idle",
+        )
+
+        app = build_dash_app(store, manager, TrajectoryStore())
+        wrapper = find_layout_component(app.layout, "serial-control-group")
+
+        self.assertIsNotNone(wrapper)
+        self.assertFalse(component_is_hidden(wrapper))
+        for component_id in (
+            "serial-port-select",
+            "serial-baud-select",
+            "serial-refresh",
+            "serial-connect",
+        ):
+            with self.subTest(component_id=component_id):
+                component = find_layout_component(app.layout, component_id)
+                self.assertIsNotNone(component)
+                self.assertFalse(component.disabled)
 
     def test_dash_upload_decoder_enforces_decoded_size_limit(self):
         encoded = "data:text/csv;base64," + "QUFB" * 3
@@ -1287,6 +2047,28 @@ class RepresentativeTrajectoryTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_no_arguments_uses_the_one_click_dashboard_defaults(self):
+        with patch("sys.argv", ["viewer"]):
+            args = parse_arguments()
+
+        self.assertFalse(args.demo)
+        self.assertEqual(args.http_port, 8071)
+
+    def test_repository_contains_one_parameterless_pycharm_profile(self):
+        run_files = sorted((Path(__file__).parent / ".run").glob("*.run.xml"))
+
+        self.assertEqual(
+            [path.name for path in run_files],
+            ["Rocket_Flight_Viewer.run.xml"],
+        )
+        profile = run_files[0].read_text(encoding="utf-8")
+        self.assertIn('name="Rocket Flight Viewer"', profile)
+        self.assertIn(
+            'SCRIPT_NAME" value="$PROJECT_DIR$/gnss_3d_visualizer.py"',
+            profile,
+        )
+        self.assertIn('PARAMETERS" value=""', profile)
+
     def test_rejects_nonfinite_speed_and_stale_timeout(self):
         for option in ("--max-speed", "--stale-timeout"):
             for value in ("nan", "inf"):
